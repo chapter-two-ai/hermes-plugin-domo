@@ -125,7 +125,7 @@ def domo_run(args: dict, session_id: str) -> str:
     store = current_store()
     action = args.get("action", "")
     if action == "start":
-        data = {"done_means": args.get("done_means", ""), "progress": 0.0,
+        data = {"done_means": args.get("done_means", ""), "progress": 0.0, "repo": args.get("repo", ""),
                 "expected_minutes": args.get("expected_minutes"), "budget_usd": args.get("budget_usd"),
                 "stall_after_minutes": args.get("stall_after_minutes") or 30,
                 "needs": args.get("needs", "")}
@@ -215,7 +215,8 @@ TOOLS: list[tuple[str, dict, Callable[..., str], str]] = [
          "expected_minutes": {"type": "number"}, "budget_usd": {"type": "number"},
          "stall_after_minutes": {"type": "number"}, "needs": {"type": "string", "description": "Credentials it depends on"},
          "progress": {"type": "number", "description": "0 to 1"}, "note": _S, "proof": _S,
-         "cost_usd": {"type": "number"}, "space": _SPACE},
+         "cost_usd": {"type": "number"}, "space": _SPACE,
+         "repo": {"type": "string", "description": "For coding runs: the repo's path on this Mac"}},
         ["action"]), domo_run, "🏃"),
     ("domo_brief", _schema(
         "domo_brief", "Publish the brief shown on the Domo home screen: prose, under 200 words, decisions first.",

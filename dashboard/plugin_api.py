@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import bridge  # noqa: E402
+from domo import bridge, repos as repo_scan  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -192,6 +192,61 @@ async def _inbox_session(profile: str, store: Store) -> str:
 @router.get("/facts")
 def facts(profile: str = Query(bridge.DEFAULT, alias="agent")):
     return {"facts": _store(profile).facts()}
+
+
+# ---- repos ------------------------------------------------------------------------------------
+
+def _repo_env() -> dict[str, str]:
+    return bridge.read_env(bridge.hermes_root())
+
+
+@router.get("/repos")
+def repos(fresh: bool = False):
+    """The Mac's git repos, most recent first. Runs name theirs in data.repo."""
+    return {"repos": repo_scan.scan(_repo_env(), fresh=fresh)}
+
+
+class StartRun(BaseModel):
+    prompt: str = Field(..., min_length=1)
+    title: str = ""
+    space: str = "Coding"
+
+
+@router.post("/repos/{repo_id}/start")
+async def start_in_repo(repo_id: str, body: StartRun, background: BackgroundTasks,
+                        profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Start an agent on a task in a repo: a tracked run now, and a session where the agent does the work."""
+    repo = repo_scan.find(repo_id, _repo_env())
+    if not repo:
+        raise HTTPException(404, f"no repo {repo_id!r} under the repo roots")
+    store = _store(profile)
+    title = (body.title or body.prompt.strip().splitlines()[0])[:80]
+    run = store.create("run", title, body=body.prompt, space=body.space,
+                       data={"repo": repo["path"], "repo_name": repo["name"], "branch": repo["branch"],
+                             "progress": 0.0, "note": "Starting", "stall_after_minutes": 30,
+                             "done_means": "The task is done and committed on a branch"})
+    session = await _passthrough(profile, "POST", "/api/sessions", body={"title": f"{repo['name']}: {title} ({run['id'][-4:]})"})
+    session_id = session.get("id") or (session.get("session") or {}).get("id") or ""
+    run = store.update(run["id"], data={"session": session_id})
+    background.add_task(_kick_off, profile, run["id"], session_id, repo, body.prompt)
+    return {"run": run, "session_id": session_id}
+
+
+async def _kick_off(profile: str, run_id: str, session_id: str, repo: dict, prompt: str) -> None:
+    message = (f"[Domo] Start a coding run in the repo at {repo['path']} ({repo['name']}, branch {repo['branch'] or 'unknown'}).\n"
+               f"Task: {prompt}\n"
+               f"It is tracked as Domo run {run_id}: work in that directory, call domo_run with action 'beat' and id "
+               f"'{run_id}' as you go (progress, note, cost_usd), ask with domo_ask before pushing, merging or "
+               f"anything outbound, and finish or fail the run with proof (the branch and commits).")
+    store = _store(profile)
+    try:
+        response = await _api(profile).request("POST", f"/api/sessions/{session_id}/chat",
+                                               json_body={"message": message}, timeout=3600.0)
+        if response.status_code >= 400:
+            store.run_finish(run_id, ok=False, note=f"The agent didn't start: http {response.status_code}")
+    except Exception as exc:
+        log.warning("domo: starting run %s for %s failed: %s", run_id, profile, exc)
+        store.run_finish(run_id, ok=False, note=f"The agent didn't start: {type(exc).__name__}")
 
 
 # ---- chat, sessions and routines (passed through to the API server) ----------------------------
