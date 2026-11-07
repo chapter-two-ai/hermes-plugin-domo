@@ -12,13 +12,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import bridge, repos as repo_scan  # noqa: E402
+from domo import bridge, files as attach, repos as repo_scan, rtk  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ async def _passthrough(profile: str, method: str, path: str, *, body: Optional[d
 async def health():
     profiles = []
     for name in bridge.profile_names():
-        entry = {**bridge.profile_info(name), "api_server": "unknown"}
+        entry = {**bridge.profile_info(name), "api_server": "unknown", "rtk": "on" if rtk.available() else "off"}
         try:
             response = await _api(name).request("GET", "/health", timeout=3.0)
             entry["api_server"] = "ok" if response.status_code == 200 else f"http {response.status_code}"
@@ -272,14 +272,50 @@ async def messages(session_id: str, profile: str = Query(bridge.DEFAULT, alias="
 
 
 class ChatIn(BaseModel):
-    message: str
+    message: str = ""
+    attachments: list[str] = []   # paths returned by POST /files
 
 
 @router.post("/sessions/{session_id}/chat/stream")
 async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    home = _home(profile)
+    found = [attach.describe(home, p) for p in body.attachments]
+    if any(f is None for f in found):
+        raise HTTPException(400, "an attachment isn't one of this agent's uploads")
+    if not body.message.strip() and not found:
+        raise HTTPException(422, "say something or attach a file")
     api = _api(profile)
-    return StreamingResponse(api.stream(f"/api/sessions/{session_id}/chat/stream", {"message": body.message}),
+    content = attach.compose(body.message, found)
+    return StreamingResponse(api.stream(f"/api/sessions/{session_id}/chat/stream", {"message": content}),
                              media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+# ---- files ------------------------------------------------------------------------------------
+
+def _home(profile: str) -> Path:
+    try:
+        return bridge.profile_home(profile)
+    except bridge.ProfileError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@router.post("/files")
+async def upload(file: UploadFile = File(...), profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Save an attachment on the Mac; send its path with the next chat message."""
+    data = await file.read(attach.MAX_BYTES + 1)
+    try:
+        return attach.save(_home(profile), file.filename or "file", data, file.content_type or "")
+    except ValueError as exc:
+        raise HTTPException(413, str(exc))
+
+
+@router.get("/files")
+def download(path: str, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """An attachment, or a file an agent returned as MEDIA:<path>."""
+    found = attach.deliverable(path, _home(profile))
+    if not found:
+        raise HTTPException(404, "not a file Domo can hand out")
+    return FileResponse(found, headers={"Cache-Control": "private, max-age=86400"})
 
 
 class ApprovalIn(BaseModel):

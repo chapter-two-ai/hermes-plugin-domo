@@ -2,6 +2,10 @@ name: domo
 version: 0.1.0
 description: "Domo: decisions, to-dos, receipts, runs, briefs and facts for the Domo app, plus its backend routes."
 author: Jonathan Gus
+hooks:
+  - pre_tool_call
+provides_hooks:
+  - pre_tool_call
 provides_tools:
   - domo_ask
   - domo_todo

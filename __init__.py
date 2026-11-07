@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import tools
+from . import rtk, tools
 from .tools import PROMPT, bound_tools
 
 
@@ -13,3 +13,5 @@ def register(ctx):
         ctx.register_tool(name=name, toolset="domo", schema=schema, handler=handler,
                           description=schema["description"], emoji=emoji)
     ctx.register_system_prompt_section("domo.chief-of-staff", PROMPT, max_chars=1200)
+    if rtk.available():
+        ctx.register_hook("pre_tool_call", rtk.pre_tool_call)
