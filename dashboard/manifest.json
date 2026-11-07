@@ -1,0 +1,13 @@
+{
+  "name": "domo",
+  "label": "Domo",
+  "description": "Decisions, to-dos, runs, receipts and briefs behind the Domo app",
+  "icon": "Inbox",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/domo",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

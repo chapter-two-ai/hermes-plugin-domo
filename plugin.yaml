@@ -1,0 +1,12 @@
+name: domo
+version: 0.1.0
+description: "Domo: decisions, to-dos, receipts, runs, briefs and facts for the Domo app, plus its backend routes."
+author: Jonathan Gus
+provides_tools:
+  - domo_ask
+  - domo_todo
+  - domo_receipt
+  - domo_run
+  - domo_brief
+  - domo_fact
+  - domo_open
