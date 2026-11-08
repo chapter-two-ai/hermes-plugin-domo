@@ -57,7 +57,7 @@ def settings() -> dict:
     env = {**bridge.read_env(bridge.hermes_root()), **os.environ}
     return {
         "url": env.get("DOMO_EMBED_URL", "http://127.0.0.1:11434/v1").rstrip("/"),
-        "model": env.get("DOMO_EMBED_MODEL", "embeddinggemma"),
+        "model": env.get("DOMO_EMBED_MODEL", "embeddinggemma-2:270m"),
         "key": env.get("DOMO_EMBED_KEY", ""),
         "off": env.get("DOMO_SEARCH", "on") == "off",
         "vec": env.get("DOMO_SQLITE_VEC", ""),

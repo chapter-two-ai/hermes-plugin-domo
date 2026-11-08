@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from . import shared
 from .store import Store, StoreError, store_path
 
 log = logging.getLogger(__name__)
@@ -37,12 +38,16 @@ def store_for(home: Path) -> Store:
     return store
 
 
+def current_home() -> Path:
+    return _bound_home.get() or home_resolver()
+
+
 def current_store() -> Store:
-    return store_for(_bound_home.get() or home_resolver())
+    return store_for(current_home())
 
 
-def bound_tools(home: Path) -> list[tuple[str, dict, Callable[..., str], str]]:
-    """TOOLS with every handler pinned to one profile's store."""
+def bound_tools(home: Path, tools: Optional[list] = None) -> list[tuple[str, dict, Callable[..., str], str]]:
+    """TOOLS (or the given tools) with every handler pinned to one profile's store."""
     def pin(handler: Callable[..., str]) -> Callable[..., str]:
         def pinned(args: dict, **kwargs: Any) -> str:
             token = _bound_home.set(home)
@@ -52,7 +57,7 @@ def bound_tools(home: Path) -> list[tuple[str, dict, Callable[..., str], str]]:
                 _bound_home.reset(token)
         pinned.__name__ = handler.__name__
         return pinned
-    return [(name, schema, pin(handler), emoji) for name, schema, handler, emoji in TOOLS]
+    return [(name, schema, pin(handler), emoji) for name, schema, handler, emoji in (TOOLS if tools is None else tools)]
 
 
 def _ok(**payload: Any) -> str:
@@ -67,7 +72,7 @@ def _guard(fn: Callable[..., str]) -> Callable[..., str]:
     def handler(args: dict, **kwargs: Any) -> str:
         try:
             return fn(args or {}, kwargs.get("session_id") or "")
-        except StoreError as exc:
+        except (StoreError, shared.SharedError) as exc:
             return _fail(str(exc))
         except Exception as exc:  # a tool must never take the turn down
             log.exception("domo tool %s failed", fn.__name__)
@@ -210,6 +215,26 @@ def domo_open(args: dict, session_id: str) -> str:
     return _ok(items=items)
 
 
+@_guard
+def domo_shared(args: dict, session_id: str) -> str:
+    home = current_home()
+    if not shared.enabled(home):
+        return _fail("shared notes are not enabled for this agent")
+    action = args.get("action", "list")
+    if action == "list":
+        return _ok(topics=shared.topics(home))
+    topic = args.get("topic", "")
+    if action == "read":
+        text = shared.read(home, topic)
+        return _ok(topic=shared.slug(topic), text=text, exists=bool(text))
+    if action == "append":
+        return _ok(topic=shared.slug(topic), added=shared.append(home, topic, args.get("text", "")))
+    if action == "write":
+        shared.write(home, topic, args.get("text", ""))
+        return _ok(topic=shared.slug(topic), written=True)
+    return _fail("action must be list, read, append or write")
+
+
 # ---- schemas ----------------------------------------------------------------------------------
 
 def _schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
@@ -308,3 +333,26 @@ PROMPT = (
     "- When you see something they will want to do next (a reply owed, a next step, a fix), prepare it and"
     " leave it with domo_suggest instead of saying 'let me know'."
 )
+
+SHARED_TOOLS: list[tuple[str, dict, Callable[..., str], str]] = [
+    ("domo_shared", _schema(
+        "domo_shared",
+        "The couple's shared notes, read and written by both partners' agents: one markdown note per topic"
+        " (Apartment hunt, Daughter, Trips, Home, Money). 'list' topics, 'read' one, 'append' a dated line"
+        " (decisions, facts, next steps), or 'write' to tidy a whole note (keep everything still true).",
+        {"action": {"type": "string", "enum": ["list", "read", "append", "write"]},
+         "topic": {"type": "string", "description": "e.g. 'Apartment hunt'"},
+         "text": {"type": "string", "description": "For append: the new line. For write: the whole note"}},
+        ["action"]), domo_shared, "🤝"),
+]
+
+
+def shared_prompt(partners: list[str]) -> str:
+    who = " and ".join(partners) if partners else "the couple"
+    return (
+        f"Shared notes (domo_shared) are the memory {who} share; the other partner's agent reads them too.\n"
+        "- Joint matters (apartment hunt, their daughter, trips, home, household money) go there, not in your own"
+        " memory or USER.md.\n"
+        "- Before answering about one, read its note. After a decision, fact or next step, append it.\n"
+        "- Keep private matters (work, health, one partner's own plans) out of shared notes."
+    )
