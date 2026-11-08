@@ -13,4 +13,5 @@ provides_tools:
   - domo_run
   - domo_brief
   - domo_fact
+  - domo_suggest
   - domo_open

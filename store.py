@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-KINDS = ("decision", "todo", "receipt", "run", "brief", "fact")
+KINDS = ("decision", "todo", "receipt", "run", "brief", "fact", "suggestion")
 
 # Statuses a client may filter on; "open" items are the ones still asking for attention.
 OPEN_STATUSES = {
@@ -71,6 +71,13 @@ CREATE TABLE IF NOT EXISTS session_spaces (
     space_id    TEXT NOT NULL,
     updated_at  REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS suggestion_votes (
+    key      TEXT NOT NULL,
+    kind     TEXT NOT NULL,
+    verdict  TEXT NOT NULL,
+    at       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS suggestion_votes_key ON suggestion_votes(key);
 CREATE TABLE IF NOT EXISTS archived_sessions (
     session_id   TEXT PRIMARY KEY,
     archived_at  REAL NOT NULL
@@ -91,32 +98,32 @@ CREATE TABLE IF NOT EXISTS files (
 """
 
 SPACE_FIELDS = ("id", "name", "icon", "color", "description", "prompt", "created_at", "updated_at")
-PALETTE = ("#6CB8F2", "#E8A87C", "#9CC5A1", "#C3A6E0", "#F2C46C", "#E89BB0")
+PALETTE = ("#4CC9F0", "#FF6B2C", "#3DD68C", "#FF2D8A", "#FFB020", "#2F5BFF")   # the brand spectrum (docs/BRAND.md §3.2)
 
 # Seeded spaces: icon, description, and the prompt the agent gets when a chat starts in the space.
 SPACE_PRESETS = {
-    "work": ("💼", "Your job: projects, colleagues, meetings and deadlines.",
+    "work": ("briefcase", "Your job: projects, colleagues, meetings and deadlines.",
              "You're helping with work. Keep answers crisp and decision-ready, and track commitments as to-dos. "
              "Ask before sending anything to colleagues or clients."),
-    "coding": ("💻", "Code, repos and long coding runs on this Mac.",
+    "coding": ("code", "Code, repos and long coding runs on this Mac.",
                "You're working on code. Work in the repo the person names and track long jobs with domo_run. "
                "Commit on a branch, and ask before pushing or merging."),
-    "personal": ("🌿", "Health, errands, money and everything that's just yours.",
+    "personal": ("leaf", "Health, errands, money and everything that's just yours.",
                  "You're helping with personal life. Be warm and brief, keep private things private, "
                  "and turn loose ends into to-dos."),
-    "apartment hunt": ("🏠", "Listings, viewings, bids and the paperwork of finding a new home.",
+    "apartment hunt": ("house", "Listings, viewings, bids and the paperwork of finding a new home.",
                        "You're helping the two of them find a new apartment. Compare listings with what you know "
                        "they want and put viewings and bids up as decisions. Never contact agents or bid without asking."),
-    "daughter": ("🧸", "School, health, activities and everything about our daughter.",
+    "daughter": ("child", "School, health, activities and everything about our daughter.",
                  "You're helping with their daughter's life: school, health and activities. Keep both parents in "
                  "the loop and note dates as to-dos. Treat her details as private."),
-    "trips": ("✈️", "Travel plans, bookings and itineraries.",
+    "trips": ("plane", "Travel plans, bookings and itineraries.",
               "You're planning trips. Gather options with prices and times and propose one plan. "
               "Ask before booking or paying for anything."),
-    "home": ("🛋️", "The household: bills, repairs, chores and shopping.",
+    "home": ("house", "The household: bills, repairs, chores and shopping.",
              "You're running the household. Keep track of bills, repairs and chores, and split the work fairly. "
              "Ask before paying or ordering anything."),
-    "family": ("👨‍👩‍👧", "The extended family: birthdays, visits and plans together.",
+    "family": ("people", "The extended family: birthdays, visits and plans together.",
                "You're helping the extended family coordinate. Keep replies short and friendly and sum plans up "
                "clearly for everyone. Ask before committing anyone to anything."),
 }
@@ -449,6 +456,28 @@ class Store:
         row = self._db.execute("SELECT * FROM session_spaces WHERE session_id = ?", (session_id,)).fetchone()
         return dict(row) if row else None
 
+    # ---- feedback on suggestions -----------------------------------------------------------
+
+    def vote(self, key: str, kind: str, verdict: str) -> None:
+        """done, dismiss, more or less: hides a suggestion, or tunes how much its kind counts."""
+        if verdict not in ("done", "dismiss", "more", "less"):
+            raise StoreError("verdict is done, dismiss, more or less")
+        with self._tx() as db:
+            db.execute("INSERT INTO suggestion_votes (key, kind, verdict, at) VALUES (?, ?, ?, ?)", (key, kind, verdict, self._clock()))
+
+    def hidden_suggestions(self, *, dismissed_for: float = 7 * 86400) -> set[str]:
+        """Done is done; a dismissal lasts a week, then the thing may come back if it's still true."""
+        now = self._clock()
+        rows = self._db.execute("SELECT key, verdict, MAX(at) FROM suggestion_votes WHERE verdict IN ('done', 'dismiss') GROUP BY key, verdict")
+        return {k for k, v, at in rows if v == "done" or now - at < dismissed_for}
+
+    def kind_weights(self) -> dict[str, float]:
+        """More like this lifts a kind, less like this lowers it; dismissals nudge it down."""
+        w: dict[str, float] = {}
+        for kind, verdict in self._db.execute("SELECT kind, verdict FROM suggestion_votes WHERE at > ?", (self._clock() - 60 * 86400,)):
+            w[kind] = w.get(kind, 1.0) * {"more": 1.15, "less": 0.8, "dismiss": 0.97, "done": 1.03}[verdict]
+        return {k: max(0.3, min(1.6, v)) for k, v in w.items()}
+
     def set_archived(self, session_id: str, archived: bool) -> None:
         """Remember what was archived here: Hermes's own listing leaves archived chats out entirely."""
         with self._tx() as db:
@@ -542,7 +571,7 @@ class Store:
 
 
 def _default_status(kind: str) -> str:
-    return {"decision": "open", "todo": "open", "run": "running", "receipt": "done", "brief": "published"}[kind]
+    return {"decision": "open", "todo": "open", "run": "running", "receipt": "done", "brief": "published", "suggestion": "open"}[kind]
 
 
 def _fact_key(key: str) -> str:

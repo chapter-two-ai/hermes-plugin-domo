@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import contextvars
 import json
 import logging
@@ -167,6 +169,18 @@ def domo_fact(args: dict, session_id: str) -> str:
 
 
 @_guard
+def domo_suggest(args: dict, session_id: str) -> str:
+    title = (args.get("title") or "").strip()
+    prompt = (args.get("prompt") or "").strip()
+    if not title or not prompt:
+        return _fail("title and prompt are required")
+    hours = float(args.get("expires_hours") or 36)
+    item = current_store().create("suggestion", title[:140], body=(args.get("because") or "").strip()[:240], space=args.get("space", ""),
+                                  session_id=session_id, data={"prompt": prompt, "expires_at": time.time() + hours * 3600})
+    return _ok(suggestion=_brief_item(item))
+
+
+@_guard
 def domo_open(args: dict, session_id: str) -> str:
     store = current_store()
     kinds = [args["kind"]] if args.get("kind") else ["decision", "todo", "run"]
@@ -226,6 +240,17 @@ TOOLS: list[tuple[str, dict, Callable[..., str], str]] = [
         "domo_fact", "Save a stable fact (VAT number, address, contact) or look one up, so it is answered once.",
         {"action": {"type": "string", "enum": ["set", "get"]}, "key": _S, "value": _S, "source": _S, "space": _SPACE},
         ["action", "key"]), domo_fact, "📌"),
+    ("domo_suggest", _schema(
+        "domo_suggest",
+        "Leave the person a suggestion for the next time they open Domo: something prepared and ready to go"
+        " (a drafted reply, a next step on a repo, a plan for tomorrow). It appears on their home screen with your"
+        " reason; tapping it opens a chat with the prompt filled in. Read and prepare only; never act for them here.",
+        {"title": {"type": "string", "description": "What to do, as a short imperative: 'Reply to Anna about Thursday'"},
+         "because": {"type": "string", "description": "Why now, in one line, naming the source: 'She asked yesterday; you're free 14:00'"},
+         "prompt": {"type": "string", "description": "The message that starts the chat when they tap it"},
+         "expires_hours": {"type": "number", "description": "When it stops being worth showing (default 36)"},
+         "space": _SPACE},
+        ["title", "prompt"]), domo_suggest, "💡"),
     ("domo_open", _schema(
         "domo_open", "List open decisions, to-dos and runs, to avoid asking twice.",
         {"kind": {"type": "string", "enum": ["decision", "todo", "run"]}}, []), domo_open, "📋"),
@@ -237,5 +262,7 @@ PROMPT = (
     "- Long jobs: domo_run start, beat while working, finish with proof.\n"
     "- After you act, domo_receipt with proof and how to undo.\n"
     "- Facts people ask for again: domo_fact.\n"
-    "- Check domo_open before asking something you may already have asked."
+    "- Check domo_open before asking something you may already have asked.\n"
+    "- When you see something they will want to do next (a reply owed, a next step, a fix), prepare it and"
+    " leave it with domo_suggest instead of saying 'let me know'."
 )

@@ -359,7 +359,8 @@ class Index:
             rows = self.db.execute("SELECT c.id, c.session_id, c.message_id, c.role, c.text, v.distance FROM vec_chunks v"
                                    " JOIN chunks c ON c.id = v.rowid WHERE v.embedding MATCH ? AND k = ? ORDER BY v.distance",
                                    (blob, k)).fetchall()
-            return [dict(r) for r in rows]
+            # a vector with no direction (an empty chunk) has no cosine distance: count it as unrelated
+            return [{**dict(r), "distance": 1.0 if r["distance"] is None else r["distance"]} for r in rows]
         ids, vecs = self._vectors()
         q = array.array("f", qvec)
         scored = sorted(((sum(map(operator.mul, q, v)), i) for i, v in zip(ids, vecs)), reverse=True)[:k]

@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import bridge, files as attach, repos as repo_scan, rtk, search as chat_search  # noqa: E402
+from domo import bridge, files as attach, repos as repo_scan, rtk, search as chat_search, suggest  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -330,6 +330,11 @@ def _when(value) -> float:
             return 0.0
 
 
+PLAN_MODE = ("[Plan mode] Investigate and propose; change nothing. Read files, search and run read-only commands as"
+             " you need, then answer with a short numbered plan: what you'd change, where, and how you'll know it"
+             " worked. Don't edit files, run anything that writes, commit, push or message anyone until they say go.")
+
+
 def _space_instructions(space: dict) -> str:
     """A chat in a space works the space's way: its name and prompt go to Hermes as this turn's extra
     system prompt (the API's ``instructions``), so they never become part of the message, its history or
@@ -409,6 +414,43 @@ async def search(q: str = "", profile: str = Query(bridge.DEFAULT, alias="agent"
     return found
 
 
+@router.get("/suggestions")
+async def suggestions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(8, ge=1, le=20)):
+    """Next up: what this person is about to do, each with its reason and one action (domo/suggest.py)."""
+    home = _home(profile)
+    store = _store(profile)
+    try:
+        jobs = _rows(await _passthrough(profile, "GET", "/api/jobs"), "jobs", "data")
+    except HTTPException:
+        jobs = []   # Hermes away: suggest from what's local
+    info = bridge.profile_info(profile)
+    repos = repo_scan.scan(_repo_env()) if info.get("kind", "person") == "person" else []
+    found = await asyncio.to_thread(suggest.build, home, store, routines=jobs, repos=repos, limit=limit)
+    tags = store.session_tags()
+    spaces = {s["name"].lower(): s["id"] for s in store.spaces()}
+    for s in found:
+        sid = (s.get("action") or {}).get("session_id")
+        s["space_id"] = tags.get(sid) if sid else spaces.get(str(s.get("space") or "").lower())
+        s["agent"] = profile
+    return {"suggestions": found}
+
+
+class VoteIn(BaseModel):
+    key: str
+    kind: str
+    verdict: str
+    item: str | None = None
+
+
+@router.post("/suggestions/vote")
+def vote(body: VoteIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    try:
+        suggest.vote(_store(profile), body.key, body.kind, body.verdict, body.item)
+    except StoreError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True}
+
+
 @router.get("/search/status")
 def search_status(profile: str = Query(bridge.DEFAULT, alias="agent")):
     chat_search.ensure_running()
@@ -479,6 +521,7 @@ class ChatIn(BaseModel):
     message: str = ""
     attachments: list[str] = []   # paths returned by POST /files
     space_id: str | None = None  # files the chat under this space first
+    mode: str | None = None   # "plan": investigate and propose, change nothing
 
 
 @router.put("/sessions/{session_id}/space")
@@ -506,8 +549,11 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
     tag = store.session_space(session_id)
     space = store.space(tag["space_id"]) if tag else None
     payload = {"message": content}
-    if space:
-        payload["instructions"] = _space_instructions(space)
+    instructions = [_space_instructions(space)] if space else []
+    if body.mode == "plan":
+        instructions.append(PLAN_MODE)
+    if instructions:
+        payload["instructions"] = "\n\n".join(instructions)
     for f in found:
         store.link_file(f["path"], session_id=session_id, space_id=space and space["id"])
     return StreamingResponse(api.stream(f"/api/sessions/{session_id}/chat/stream", payload),
