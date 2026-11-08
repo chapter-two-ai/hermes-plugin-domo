@@ -718,7 +718,7 @@ async def run_approval(run_id: str, body: ApprovalIn, profile: str = Query(bridg
 @router.get("/jobs")
 async def jobs(profile: str = Query(bridge.DEFAULT, alias="agent")):
     tags = _store(profile).job_tags()
-    listing = await _passthrough(profile, "GET", "/api/jobs")
+    listing = await _passthrough(profile, "GET", "/api/jobs", params={"include_disabled": "true"})
     for job in _rows(listing, "jobs"):
         job["space_id"] = tags.get(str(job.get("id")))
     return listing
@@ -730,6 +730,107 @@ def tag_job(job_id: str, body: SpaceTag, profile: str = Query(bridge.DEFAULT, al
     if body.space_id:
         _space_or_404(store, body.space_id)
     return {"job_id": job_id, "space_id": store.tag_job(job_id, body.space_id)}
+
+
+_JOB_ID = re.compile(r"^[a-f0-9]{12}$")
+_SCHEDULE_HELP = "Hermes doesn't read that schedule: try 0 8 * * *, every 2h, 30m, weekdays at 9am or every monday 9am"
+
+
+class JobIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    schedule: str = Field(..., min_length=1, max_length=120)
+    prompt: str = Field(..., min_length=1, max_length=20000)
+    deliver: str = Field("local", max_length=200)
+    skills: list[str] = []
+
+
+class JobPatch(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=120)
+    schedule: str | None = Field(None, min_length=1, max_length=120)
+    prompt: str | None = Field(None, min_length=1, max_length=20000)
+    deliver: str | None = Field(None, max_length=200)
+    skills: list[str] | None = None
+    enabled: bool | None = None
+
+
+def _job_id(job_id: str) -> str:
+    if not _JOB_ID.match(job_id):
+        raise HTTPException(404, "no such routine")
+    return job_id
+
+
+async def _job_write(profile: str, method: str, path: str, body: dict):
+    try:
+        return await _passthrough(profile, method, path, body=body)
+    except HTTPException as exc:
+        if exc.status_code in (400, 500) and "schedule" in body:
+            raise HTTPException(400, _SCHEDULE_HELP)   # Hermes answers a bad schedule on PATCH with a 500
+        raise
+
+
+@router.post("/jobs", status_code=201)
+async def create_job(body: JobIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    return await _job_write(profile, "POST", "/api/jobs", body.model_dump())
+
+
+@router.patch("/jobs/{job_id}")
+async def update_job(job_id: str, body: JobPatch, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Edit a routine: name, schedule, prompt, delivery, skills, or on/off."""
+    patch = body.model_dump(exclude_none=True)
+    if not patch:
+        raise HTTPException(400, "nothing to change")
+    return await _job_write(profile, "PATCH", f"/api/jobs/{_job_id(job_id)}", patch)
+
+
+@router.delete("/jobs/{job_id}", status_code=204)
+async def delete_job(job_id: str, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    await _passthrough(profile, "DELETE", f"/api/jobs/{_job_id(job_id)}")
+    _store(profile).tag_job(job_id, None)
+
+
+_RUN_FILE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})\.md$")
+
+
+def _read_run(path: Path) -> dict:
+    """One run's saved output (Hermes writes one per run, delivered or not): when, how it went, what it said."""
+    m = _RUN_FILE.match(path.name)
+    at = f"{m[1]}T{m[2]}:{m[3]}:{m[4]}" if m else ""
+    doc = path.read_text(errors="replace")
+    status_line = re.search(r"^\*\*Status:\*\*\s*(.+)$", doc, re.M)
+    response = doc.split("## Response", 1)[1].strip() if "## Response" in doc else re.sub(r"^#.*\n|^\*\*[^*]+:\*\*.*\n", "", doc, flags=re.M).strip()
+    if status_line and not status_line[1].upper().startswith("OK"):
+        status = "failed"
+    elif "[CRON_FAILURE]" in response or response.startswith("Error:"):
+        status = "failed"
+    elif response.strip() == "[SILENT]" or not response.strip():
+        status = "silent"
+    else:
+        status = "ok"
+    return {"at": at, "status": status, "response": response[:12000], "file": path.name}
+
+
+@router.get("/jobs/{job_id}/runs")
+async def job_runs(job_id: str, profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(20, ge=1, le=50)):
+    """A routine's recent runs, newest first, with what each one said and the chat it ran in."""
+    folder = _home(profile) / "cron" / "output" / _job_id(job_id)
+    files = sorted((p for p in folder.glob("*.md") if _RUN_FILE.match(p.name)), reverse=True)[:limit] if folder.is_dir() else []
+    runs = [_read_run(p) for p in files]
+    try:   # the chat each agent run happened in, matched by its title's stamp ("<job> · Nov 08 16:20")
+        job = await _passthrough(profile, "GET", f"/api/jobs/{job_id}")
+        name = (job.get("job") or job).get("name", "")
+        sessions = _rows(await _passthrough(profile, "GET", "/api/sessions", params={"limit": 200}), "data", "sessions")
+        by_stamp = {}
+        for s in sessions:
+            t = RUN_TITLE.match(s.get("title") or "")
+            if t and t["job"] == name:
+                by_stamp[(s.get("title") or "").rsplit(" · ", 1)[1]] = s.get("id")
+        for r in runs:
+            if r["at"]:
+                stamp = datetime.fromisoformat(r["at"]).strftime("%b %d %H:%M")
+                r["session_id"] = by_stamp.get(stamp)
+    except (HTTPException, ValueError):
+        pass
+    return {"runs": runs}
 
 
 @router.post("/jobs/{job_id}/{action}")
