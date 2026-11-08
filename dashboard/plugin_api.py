@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +23,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import access, bridge, files as attach, memory, repos as repo_scan, rtk, search as chat_search, suggest  # noqa: E402
+from domo import access, bridge, filing, files as attach, memory, repos as repo_scan, rtk, search as chat_search, suggest  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -242,6 +243,7 @@ class SpaceIn(BaseModel):
     color: str = Field("", pattern=_COLOR)
     description: str = ""
     prompt: str = ""
+    parent_id: str | None = None   # a sub-space: Work › Baltazar
 
 
 class SpacePatch(BaseModel):
@@ -288,10 +290,13 @@ async def space_detail(space_id: str, profile: str = Query(bridge.DEFAULT, alias
     store = _store(profile)
     space = _space_or_404(store, space_id)
     tags, job_tags = store.session_tags(), store.job_tags()
+    children = store.children(space_id)
+    # a space's chats include its sub-spaces' chats, each saying where it's filed
+    inside = {space_id, *(c["id"] for c in children)}
     try:
         sessions = _rows(await _passthrough(profile, "GET", "/api/sessions", params={"limit": 200}), "data", "sessions")
     except HTTPException:
-        sessions = [{"id": sid} for sid, tagged in tags.items() if tagged == space_id]
+        sessions = [{"id": sid} for sid, tagged in tags.items() if tagged in inside]
     try:
         jobs = _rows(await _passthrough(profile, "GET", "/api/jobs"), "jobs")
     except HTTPException:
@@ -304,10 +309,18 @@ async def space_detail(space_id: str, profile: str = Query(bridge.DEFAULT, alias
         if match and match["job"] in job_ids:
             runs.append({**_chat(s), "job_id": job_ids[match["job"]]})
     run_ids = {r["id"] for r in runs}
-    chats = [_chat(s) for s in sessions
-             if tags.get(s.get("id")) == space_id or (s.get("id") in run_ids and not tags.get(s.get("id")))]
-    return {"space": space, "chats": _newest(chats), "files": store.files(space_id), "routines": routines,
-            "runs": _newest(runs)[:10], "items": store.space_items(space_id)}
+    filings = store.filings()
+    chats = [{**_chat(s), "space_id": tags.get(s.get("id")), **_filed(filings.get(s.get("id")))} for s in sessions
+             if tags.get(s.get("id")) in inside or (s.get("id") in run_ids and not tags.get(s.get("id")))]
+    return {"space": space, "lineage": store.lineage(space_id), "children": children, "chats": _newest(chats),
+            "files": store.files(space_id), "routines": routines, "runs": _newest(runs)[:10], "items": store.space_items(space_id)}
+
+
+def _filed(f: Optional[dict]) -> dict:
+    """Who filed a chat where it is: the person, or Domo (how sure, and why)."""
+    if not f or not f["space_id"]:
+        return {}
+    return {"filed_by": f["filed_by"], "filing_confidence": f["confidence"], "filing_reason": f["reason"]}
 
 
 def _rows(payload, *keys: str) -> list[dict]:
@@ -343,10 +356,15 @@ PLAN_MODE = ("[Plan mode] Investigate and propose; change nothing. Read files, s
              " worked. Don't edit files, run anything that writes, commit, push or message anyone until they say go.")
 
 
-def _space_instructions(space: dict) -> str:
+def _space_instructions(space: dict, parent: Optional[dict] = None) -> str:
     """A chat in a space works the space's way: its name and prompt go to Hermes as this turn's extra
     system prompt (the API's ``instructions``), so they never become part of the message, its history or
-    the chat's title, and an edited prompt applies from the next turn."""
+    the chat's title, and an edited prompt applies from the next turn. A sub-space adds its own to its
+    parent's: Work's way of working, then what's particular to Baltazar."""
+    if parent:
+        head = f"[Domo space: {parent['name']} › {space['name']}]"
+        parts = [parent["prompt"], space["description"] and f"This chat is about {space['name']}: {space['description']}", space["prompt"]]
+        return head + "".join(f"\n{p}" for p in parts if p)
     return f"[Domo space: {space['name']}]" + (f"\n{space['prompt']}" if space["prompt"] else "")
 
 
@@ -520,9 +538,27 @@ async def sessions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit: i
         listing = {"object": "list", "data": await _archived_sessions(profile, store)}
     else:
         listing = await _passthrough(profile, "GET", "/api/sessions", params={"limit": limit})
+    filings = store.filings()
     for row in _rows(listing, "data", "sessions"):
         row["space_id"] = tags.get(row.get("id"))
+        row.update(_filed(filings.get(row.get("id"))))
     return listing
+
+
+class FileIn(BaseModel):
+    session_id: str | None = None   # one chat; without it, a sweep of everything unfiled
+
+
+@router.post("/filing")
+async def file_now(body: FileIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Work out where chats belong now (the routine does this on its own): one, or all that are unfiled."""
+    home, store = _home(profile), _store(profile)
+    if not filing.jev_key():
+        raise HTTPException(503, "Filing needs TYPESAFE_API_KEY in the agent's environment")
+    if body.session_id:
+        done = await asyncio.to_thread(filing.file_session, home, store, body.session_id)
+        return {"filed": [done] if done else []}
+    return {"filed": await asyncio.to_thread(filing.sweep, home, store)}
 
 
 async def _archived_sessions(profile: str, store) -> list[dict]:
@@ -557,11 +593,41 @@ async def archive_session(session_id: str, body: ArchiveIn, profile: str = Query
 
 class NewSession(BaseModel):
     title: str = ""
+    model: str | None = None
+    provider: str | None = None
 
 
 @router.post("/sessions")
 async def new_session(body: NewSession, profile: str = Query(bridge.DEFAULT, alias="agent")):
-    return await _passthrough(profile, "POST", "/api/sessions", body={"title": body.title} if body.title else {})
+    payload = {"title": body.title} if body.title else {}
+    if body.model:   # a chat started on a chosen model keeps it (Hermes stores it on the session)
+        payload.update({"model": body.model, **({"provider": body.provider} if body.provider else {})})
+    return await _passthrough(profile, "POST", "/api/sessions", body=payload)
+
+
+_FAMILY = re.compile(r"(opus|sonnet|haiku)", re.I)
+
+
+def _version(model_id: str) -> tuple:
+    """claude-opus-5-5 > claude-opus-5 > claude-opus-4-8; dated snapshots after their family's newest."""
+    nums = [int(n) for n in re.findall(r"(?<![0-9])(\d{1,2})(?![0-9])", model_id)]
+    return (tuple(nums), -len(model_id))
+
+
+@router.get("/models")
+async def models(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """The models this agent's provider offers, and the newest Opus, Sonnet and Haiku among them, for
+    the one-click switch on a new chat."""
+    options = await _passthrough(profile, "GET", "/api/model/options")
+    providers = options.get("providers") or []
+    current = next((p for p in providers if p.get("is_current")), providers[0] if providers else {})
+    ids = [m if isinstance(m, str) else m.get("id", "") for m in current.get("models") or []]
+    families: dict[str, str] = {}
+    for fam in ("opus", "sonnet", "haiku"):
+        pick = sorted((i for i in ids if fam in i.lower()), key=_version, reverse=True)
+        if pick:
+            families[fam] = pick[0]
+    return {"provider": current.get("slug") or options.get("provider"), "model": options.get("model"), "families": families, "models": ids}
 
 
 @router.get("/sessions/{session_id}/messages")
@@ -575,6 +641,8 @@ class ChatIn(BaseModel):
     attachments: list[str] = []   # paths returned by POST /files
     space_id: str | None = None  # files the chat under this space first
     mode: str | None = None   # "plan": investigate and propose, change nothing
+    model: str | None = None   # this turn and the ones after it, on this model (Hermes's model lock)
+    provider: str | None = None
 
 
 @router.put("/sessions/{session_id}/space")
@@ -600,9 +668,12 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
     api = _api(profile)
     content = attach.compose(body.message, found)
     tag = store.session_space(session_id)
-    space = store.space(tag["space_id"]) if tag else None
+    space = store.space(tag["space_id"]) if tag and tag["space_id"] else None
+    parent = store.space(space["parent_id"]) if space and space.get("parent_id") else None
     payload = {"message": content}
-    instructions = [_space_instructions(space)] if space else []
+    if body.model:   # locked, so it holds: a bare model only counts on a session's first turn
+        payload.update({"model": body.model, "require_model_lock": True, **({"provider": body.provider} if body.provider else {})})
+    instructions = [_space_instructions(space, parent)] if space else []
     known = memory.for_prompt(store)
     if known:
         instructions.append(known)
@@ -614,8 +685,21 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
         payload["instructions"] = "\n\n".join(instructions)
     for f in found:
         store.link_file(f["path"], session_id=session_id, space_id=space and space["id"])
-    return StreamingResponse(api.stream(f"/api/sessions/{session_id}/chat/stream", payload),
-                             media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    async def then_file():
+        async for chunk in api.stream(f"/api/sessions/{session_id}/chat/stream", payload):
+            yield chunk
+        # just started chatting, with no space: Domo works out where it belongs, off the request
+        if not store.session_space(session_id):
+            threading.Thread(target=_file_quietly, args=(home, store, session_id), daemon=True).start()
+
+    return StreamingResponse(then_file(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+def _file_quietly(home: Path, store: Store, session_id: str) -> None:
+    try:
+        filing.after_turn(home, store, session_id)
+    except Exception:   # filing is a nicety: a chat never fails for it
+        log.exception("filing %s", session_id)
 
 
 # ---- files ------------------------------------------------------------------------------------
@@ -672,7 +756,7 @@ async def run_approval(run_id: str, body: ApprovalIn, profile: str = Query(bridg
 @router.get("/jobs")
 async def jobs(profile: str = Query(bridge.DEFAULT, alias="agent")):
     tags = _store(profile).job_tags()
-    listing = await _passthrough(profile, "GET", "/api/jobs")
+    listing = await _passthrough(profile, "GET", "/api/jobs", params={"include_disabled": "true"})
     for job in _rows(listing, "jobs"):
         job["space_id"] = tags.get(str(job.get("id")))
     return listing
@@ -684,6 +768,107 @@ def tag_job(job_id: str, body: SpaceTag, profile: str = Query(bridge.DEFAULT, al
     if body.space_id:
         _space_or_404(store, body.space_id)
     return {"job_id": job_id, "space_id": store.tag_job(job_id, body.space_id)}
+
+
+_JOB_ID = re.compile(r"^[a-f0-9]{12}$")
+_SCHEDULE_HELP = "Hermes doesn't read that schedule: try 0 8 * * *, every 2h, 30m, weekdays at 9am or every monday 9am"
+
+
+class JobIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    schedule: str = Field(..., min_length=1, max_length=120)
+    prompt: str = Field(..., min_length=1, max_length=20000)
+    deliver: str = Field("local", max_length=200)
+    skills: list[str] = []
+
+
+class JobPatch(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=120)
+    schedule: str | None = Field(None, min_length=1, max_length=120)
+    prompt: str | None = Field(None, min_length=1, max_length=20000)
+    deliver: str | None = Field(None, max_length=200)
+    skills: list[str] | None = None
+    enabled: bool | None = None
+
+
+def _job_id(job_id: str) -> str:
+    if not _JOB_ID.match(job_id):
+        raise HTTPException(404, "no such routine")
+    return job_id
+
+
+async def _job_write(profile: str, method: str, path: str, body: dict):
+    try:
+        return await _passthrough(profile, method, path, body=body)
+    except HTTPException as exc:
+        if exc.status_code in (400, 500) and "schedule" in body:
+            raise HTTPException(400, _SCHEDULE_HELP)   # Hermes answers a bad schedule on PATCH with a 500
+        raise
+
+
+@router.post("/jobs", status_code=201)
+async def create_job(body: JobIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    return await _job_write(profile, "POST", "/api/jobs", body.model_dump())
+
+
+@router.patch("/jobs/{job_id}")
+async def update_job(job_id: str, body: JobPatch, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Edit a routine: name, schedule, prompt, delivery, skills, or on/off."""
+    patch = body.model_dump(exclude_none=True)
+    if not patch:
+        raise HTTPException(400, "nothing to change")
+    return await _job_write(profile, "PATCH", f"/api/jobs/{_job_id(job_id)}", patch)
+
+
+@router.delete("/jobs/{job_id}", status_code=204)
+async def delete_job(job_id: str, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    await _passthrough(profile, "DELETE", f"/api/jobs/{_job_id(job_id)}")
+    _store(profile).tag_job(job_id, None)
+
+
+_RUN_FILE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})\.md$")
+
+
+def _read_run(path: Path) -> dict:
+    """One run's saved output (Hermes writes one per run, delivered or not): when, how it went, what it said."""
+    m = _RUN_FILE.match(path.name)
+    at = f"{m[1]}T{m[2]}:{m[3]}:{m[4]}" if m else ""
+    doc = path.read_text(errors="replace")
+    status_line = re.search(r"^\*\*Status:\*\*\s*(.+)$", doc, re.M)
+    response = doc.split("## Response", 1)[1].strip() if "## Response" in doc else re.sub(r"^#.*\n|^\*\*[^*]+:\*\*.*\n", "", doc, flags=re.M).strip()
+    if status_line and not status_line[1].upper().startswith("OK"):
+        status = "failed"
+    elif "[CRON_FAILURE]" in response or response.startswith("Error:"):
+        status = "failed"
+    elif response.strip() == "[SILENT]" or not response.strip():
+        status = "silent"
+    else:
+        status = "ok"
+    return {"at": at, "status": status, "response": response[:12000], "file": path.name}
+
+
+@router.get("/jobs/{job_id}/runs")
+async def job_runs(job_id: str, profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(20, ge=1, le=50)):
+    """A routine's recent runs, newest first, with what each one said and the chat it ran in."""
+    folder = _home(profile) / "cron" / "output" / _job_id(job_id)
+    files = sorted((p for p in folder.glob("*.md") if _RUN_FILE.match(p.name)), reverse=True)[:limit] if folder.is_dir() else []
+    runs = [_read_run(p) for p in files]
+    try:   # the chat each agent run happened in, matched by its title's stamp ("<job> · Nov 08 16:20")
+        job = await _passthrough(profile, "GET", f"/api/jobs/{job_id}")
+        name = (job.get("job") or job).get("name", "")
+        sessions = _rows(await _passthrough(profile, "GET", "/api/sessions", params={"limit": 200}), "data", "sessions")
+        by_stamp = {}
+        for s in sessions:
+            t = RUN_TITLE.match(s.get("title") or "")
+            if t and t["job"] == name:
+                by_stamp[(s.get("title") or "").rsplit(" · ", 1)[1]] = s.get("id")
+        for r in runs:
+            if r["at"]:
+                stamp = datetime.fromisoformat(r["at"]).strftime("%b %d %H:%M")
+                r["session_id"] = by_stamp.get(stamp)
+    except (HTTPException, ValueError):
+        pass
+    return {"runs": runs}
 
 
 @router.post("/jobs/{job_id}/{action}")

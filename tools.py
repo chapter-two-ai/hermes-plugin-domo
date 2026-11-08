@@ -304,7 +304,7 @@ PROMPT = (
     "- After you act, domo_receipt with proof and how to undo.\n"
     "- Facts people ask for again: domo_fact.\n"
     "- Check domo_open before asking something you may already have asked.\n"
-    "- When they tell you how they like things, or you see the same pattern twice, domo_memory learn it.\n"
+    "- When they tell you how they like things, or you see the same pattern twice, domo_memory learn it.\n"    "- Reports, digests and replies with posts, numbers or screenshots: follow the domo-rich-reports skill.\n"
     "- When you see something they will want to do next (a reply owed, a next step, a fix), prepare it and"
     " leave it with domo_suggest instead of saying 'let me know'."
 )
