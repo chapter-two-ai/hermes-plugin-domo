@@ -1,18 +1,21 @@
 """Domo app backend, mounted by the Hermes dashboard at /api/plugins/domo/.
 
 The dashboard's login gate guards every route. Domo's own data (brief, decisions, to-dos, runs,
-receipts, facts) is read from the profile's store; chat, sessions and routines are passed through
-to that profile's API server over loopback.
+receipts, facts, spaces) is read from the profile's store; chat, sessions and routines are passed
+through to that profile's API server over loopback, with the space each is filed under joined in.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -25,6 +28,7 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 VERSION = "0.1.0"
 INBOX_TITLE = "Domo inbox"
+RUN_TITLE = re.compile(r"^(?P<job>.+) · [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}$")  # "<job name> · Nov 08 00:00"
 
 _stores: dict[str, Store] = {}
 transport = None  # tests inject an httpx transport for the API server
@@ -38,7 +42,22 @@ def _store(profile: str) -> Store:
     path = str(store_path(home))
     if path not in _stores:
         _stores[path] = Store(Path(path))
+        _stores[path].seed_spaces(_seed_names(profile, home))
     return _stores[path]
+
+
+def _seed_names(profile: str, home: Path) -> list[str]:
+    """DOMO_SPACES (the profile's .env, then the process's), else defaults for the kind of profile."""
+    listed = bridge.read_env(home).get("DOMO_SPACES") or os.environ.get("DOMO_SPACES", "")
+    if listed.strip():
+        return [n.strip() for n in listed.split(",") if n.strip()]
+    profile = (profile or bridge.DEFAULT).lower()
+    kind = bridge.profile_info(profile).get("kind")
+    if profile in (bridge.DEFAULT, "family") or kind == "group":
+        return ["Family"]
+    if profile == "ours" or kind == "shared":
+        return ["Apartment hunt", "Daughter", "Trips", "Home"]
+    return ["Work", "Coding", "Personal"]
 
 
 def _api(profile: str) -> bridge.ApiServer:
@@ -100,8 +119,9 @@ def feed(profile: str = Query(bridge.DEFAULT, alias="agent")):
 
 @router.get("/changes")
 def changes(profile: str = Query(bridge.DEFAULT, alias="agent"), since: int = Query(0, ge=0)):
-    items, cursor = _store(profile).changed_since(since)
-    return {"items": items, "cursor": cursor}
+    store = _store(profile)
+    items, cursor = store.changed_since(since)
+    return {"items": items, "spaces": store.spaces_changed_since(since), "cursor": cursor}
 
 
 @router.get("/items")
@@ -194,6 +214,127 @@ def facts(profile: str = Query(bridge.DEFAULT, alias="agent")):
     return {"facts": _store(profile).facts()}
 
 
+# ---- spaces -----------------------------------------------------------------------------------
+
+def _space_or_404(store: Store, space_id: str) -> dict:
+    space = store.space(space_id)
+    if not space:
+        raise HTTPException(404, f"no space {space_id!r}")
+    return space
+
+
+_COLOR = r"^(#[0-9A-Fa-f]{6})?$"
+
+
+class SpaceIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    icon: str = Field("", max_length=16)
+    color: str = Field("", pattern=_COLOR)
+    description: str = ""
+    prompt: str = ""
+
+
+class SpacePatch(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=80)
+    icon: str | None = Field(None, max_length=16)
+    color: str | None = Field(None, pattern=_COLOR)
+    description: str | None = None
+    prompt: str | None = None
+
+
+class SpaceTag(BaseModel):
+    space_id: str | None = None
+
+
+@router.get("/spaces")
+def spaces(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    return {"spaces": _store(profile).spaces()}
+
+
+@router.post("/spaces", status_code=201)
+def create_space(body: SpaceIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    return _store_call(_store(profile).create_space, **body.model_dump())
+
+
+@router.patch("/spaces/{space_id}")
+def patch_space(space_id: str, body: SpacePatch, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    store = _store(profile)
+    _space_or_404(store, space_id)
+    return _store_call(store.update_space, space_id, **body.model_dump(exclude_unset=True))
+
+
+@router.delete("/spaces/{space_id}")
+def delete_space(space_id: str, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    store = _store(profile)
+    _space_or_404(store, space_id)
+    store.delete_space(space_id)
+    return {"ok": True}
+
+
+@router.get("/spaces/{space_id}")
+async def space_detail(space_id: str, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """A space's chats, files, routines, recent routine runs and open items. Chats and routines come
+    from the API server; when it is down the space still shows, with tagged chats bare and no routines."""
+    store = _store(profile)
+    space = _space_or_404(store, space_id)
+    tags, job_tags = store.session_tags(), store.job_tags()
+    try:
+        sessions = _rows(await _passthrough(profile, "GET", "/api/sessions", params={"limit": 200}), "data", "sessions")
+    except HTTPException:
+        sessions = [{"id": sid} for sid, tagged in tags.items() if tagged == space_id]
+    try:
+        jobs = _rows(await _passthrough(profile, "GET", "/api/jobs"), "jobs")
+    except HTTPException:
+        jobs = []
+    routines = [{**j, "space_id": space_id} for j in jobs if job_tags.get(str(j.get("id"))) == space_id]
+    job_ids = {j["name"]: j.get("id") for j in routines if j.get("name")}
+    runs = []
+    for s in sessions:
+        match = RUN_TITLE.match(s.get("title") or "")
+        if match and match["job"] in job_ids:
+            runs.append({**_chat(s), "job_id": job_ids[match["job"]]})
+    run_ids = {r["id"] for r in runs}
+    chats = [_chat(s) for s in sessions
+             if tags.get(s.get("id")) == space_id or (s.get("id") in run_ids and not tags.get(s.get("id")))]
+    return {"space": space, "chats": _newest(chats), "files": store.files(space_id), "routines": routines,
+            "runs": _newest(runs)[:10], "items": store.space_items(space_id)}
+
+
+def _rows(payload, *keys: str) -> list[dict]:
+    """The list inside an API server listing, whichever key it uses."""
+    if isinstance(payload, list):
+        return payload
+    return next((payload[k] for k in keys if isinstance(payload.get(k), list)), [])
+
+
+def _chat(session: dict) -> dict:
+    return {"id": session.get("id"), "title": session.get("title") or "",
+            "last_active": session.get("last_active") or session.get("updated_at") or session.get("started_at"),
+            "preview": session.get("preview") or "", "message_count": session.get("message_count") or 0}
+
+
+def _newest(rows: list[dict]) -> list[dict]:
+    return sorted(rows, key=lambda r: _when(r.get("last_active")), reverse=True)
+
+
+def _when(value) -> float:
+    """Hermes times may be epoch seconds or ISO strings."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+
+
+def _space_instructions(space: dict) -> str:
+    """A chat in a space works the space's way: its name and prompt go to Hermes as this turn's extra
+    system prompt (the API's ``instructions``), so they never become part of the message, its history or
+    the chat's title, and an edited prompt applies from the next turn."""
+    return f"[Domo space: {space['name']}]" + (f"\n{space['prompt']}" if space["prompt"] else "")
+
+
 # ---- repos ------------------------------------------------------------------------------------
 
 def _repo_env() -> dict[str, str]:
@@ -253,7 +394,11 @@ async def _kick_off(profile: str, run_id: str, session_id: str, repo: dict, prom
 
 @router.get("/sessions")
 async def sessions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(30, ge=1, le=200)):
-    return await _passthrough(profile, "GET", "/api/sessions", params={"limit": limit})
+    tags = _store(profile).session_tags()
+    listing = await _passthrough(profile, "GET", "/api/sessions", params={"limit": limit})
+    for row in _rows(listing, "data", "sessions"):
+        row["space_id"] = tags.get(row.get("id"))
+    return listing
 
 
 class NewSession(BaseModel):
@@ -274,6 +419,15 @@ async def messages(session_id: str, profile: str = Query(bridge.DEFAULT, alias="
 class ChatIn(BaseModel):
     message: str = ""
     attachments: list[str] = []   # paths returned by POST /files
+    space_id: str | None = None  # files the chat under this space first
+
+
+@router.put("/sessions/{session_id}/space")
+def tag_session(session_id: str, body: SpaceTag, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    store = _store(profile)
+    if body.space_id:
+        _space_or_404(store, body.space_id)
+    return {"session_id": session_id, "space_id": store.tag_session(session_id, body.space_id)}
 
 
 @router.post("/sessions/{session_id}/chat/stream")
@@ -284,9 +438,20 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
         raise HTTPException(400, "an attachment isn't one of this agent's uploads")
     if not body.message.strip() and not found:
         raise HTTPException(422, "say something or attach a file")
+    store = _store(profile)
+    if body.space_id:
+        _space_or_404(store, body.space_id)
+        store.tag_session(session_id, body.space_id)
     api = _api(profile)
     content = attach.compose(body.message, found)
-    return StreamingResponse(api.stream(f"/api/sessions/{session_id}/chat/stream", {"message": content}),
+    tag = store.session_space(session_id)
+    space = store.space(tag["space_id"]) if tag else None
+    payload = {"message": content}
+    if space:
+        payload["instructions"] = _space_instructions(space)
+    for f in found:
+        store.link_file(f["path"], session_id=session_id, space_id=space and space["id"])
+    return StreamingResponse(api.stream(f"/api/sessions/{session_id}/chat/stream", payload),
                              media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
@@ -300,18 +465,30 @@ def _home(profile: str) -> Path:
 
 
 @router.post("/files")
-async def upload(file: UploadFile = File(...), profile: str = Query(bridge.DEFAULT, alias="agent")):
-    """Save an attachment on the Mac; send its path with the next chat message."""
+async def upload(file: UploadFile = File(...), space_id: Optional[str] = Form(None),
+                 session_id: Optional[str] = Form(None), profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Save an attachment on the Mac; send its path with the next chat message. A file sent from a
+    chat in a space is filed under that space unless another is named."""
+    store = _store(profile)
+    if space_id:
+        _space_or_404(store, space_id)
+    elif session_id:
+        space_id = (store.session_space(session_id) or {}).get("space_id")
     data = await file.read(attach.MAX_BYTES + 1)
     try:
-        return attach.save(_home(profile), file.filename or "file", data, file.content_type or "")
+        return attach.save(_home(profile), file.filename or "file", data, file.content_type or "",
+                           store=store, space_id=space_id, session_id=session_id)
     except ValueError as exc:
         raise HTTPException(413, str(exc))
 
 
 @router.get("/files")
-def download(path: str, profile: str = Query(bridge.DEFAULT, alias="agent")):
-    """An attachment, or a file an agent returned as MEDIA:<path>."""
+def download(path: Optional[str] = None, space_id: Optional[str] = None,
+             profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """With ``path``: an attachment, or a file an agent returned as MEDIA:<path>. Without: the
+    upload records, newest first, optionally only one space's."""
+    if not path:
+        return {"files": _store(profile).files(space_id)}
     found = attach.deliverable(path, _home(profile))
     if not found:
         raise HTTPException(404, "not a file Domo can hand out")
@@ -320,7 +497,7 @@ def download(path: str, profile: str = Query(bridge.DEFAULT, alias="agent")):
 
 class ApprovalIn(BaseModel):
     request_id: str
-    execution_generation: Optional[int] = None
+    execution_generation: int | None = None
     choice: str
 
 
@@ -331,7 +508,19 @@ async def run_approval(run_id: str, body: ApprovalIn, profile: str = Query(bridg
 
 @router.get("/jobs")
 async def jobs(profile: str = Query(bridge.DEFAULT, alias="agent")):
-    return await _passthrough(profile, "GET", "/api/jobs")
+    tags = _store(profile).job_tags()
+    listing = await _passthrough(profile, "GET", "/api/jobs")
+    for job in _rows(listing, "jobs"):
+        job["space_id"] = tags.get(str(job.get("id")))
+    return listing
+
+
+@router.put("/jobs/{job_id}/space")
+def tag_job(job_id: str, body: SpaceTag, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    store = _store(profile)
+    if body.space_id:
+        _space_or_404(store, body.space_id)
+    return {"job_id": job_id, "space_id": store.tag_job(job_id, body.space_id)}
 
 
 @router.post("/jobs/{job_id}/{action}")

@@ -31,7 +31,9 @@ def _safe_name(name: str) -> str:
     return name[:120]
 
 
-def save(home: Path, name: str, data: bytes, mime: str = "") -> dict:
+def save(home: Path, name: str, data: bytes, mime: str = "", *, store=None, space_id: str | None = None,
+         session_id: str | None = None) -> dict:
+    """Write an upload under the profile's files folder; with a store, also record it (and its space)."""
     if len(data) > MAX_BYTES:
         raise ValueError(f"{name} is {len(data) // (1024 * 1024)} MB; the limit is {MAX_BYTES // (1024 * 1024)} MB")
     safe = _safe_name(name)
@@ -41,7 +43,10 @@ def save(home: Path, name: str, data: bytes, mime: str = "") -> dict:
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{uuid.uuid4().hex[:8]}-{safe}"
     path.write_bytes(data)
-    return {"id": path.stem, "name": safe, "mime": mime, "size": len(data), "path": str(path)}
+    saved = {"id": path.stem, "name": safe, "mime": mime, "size": len(data), "path": str(path)}
+    if store is None:
+        return saved
+    return {**store.add_file(str(path), safe, mime, len(data), space_id=space_id, session_id=session_id), **saved}
 
 
 def describe(home: Path, path: str) -> dict | None:
