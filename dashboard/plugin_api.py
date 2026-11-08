@@ -653,6 +653,19 @@ def tag_session(session_id: str, body: SpaceTag, profile: str = Query(bridge.DEF
     return {"session_id": session_id, "space_id": store.tag_session(session_id, body.space_id)}
 
 
+# chats with a turn streaming through Domo right now, per profile: {session_id: turns in flight}
+_WORKING: dict[str, dict[str, int]] = {}
+
+
+@router.get("/working")
+def working(request: Request, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Session ids with a turn running now, from any device (cheap: meant to be polled every second or two)."""
+    allowed = access.allowed_profiles(request)
+    if allowed is not None and profile not in allowed:
+        raise HTTPException(403, "not your agent")
+    return {"sessions": sorted(_WORKING.get(profile, {}))}
+
+
 @router.post("/sessions/{session_id}/chat/stream")
 async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
     home = _home(profile)
@@ -686,8 +699,17 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
     for f in found:
         store.link_file(f["path"], session_id=session_id, space_id=space and space["id"])
     async def then_file():
-        async for chunk in api.stream(f"/api/sessions/{session_id}/chat/stream", payload):
-            yield chunk
+        mine = _WORKING.setdefault(profile, {})
+        mine[session_id] = mine.get(session_id, 0) + 1
+        try:
+            async for chunk in api.stream(f"/api/sessions/{session_id}/chat/stream", payload):
+                yield chunk
+        finally:
+            left = mine.get(session_id, 1) - 1
+            if left > 0:
+                mine[session_id] = left
+            else:
+                mine.pop(session_id, None)
         # just started chatting, with no space: Domo works out where it belongs, off the request
         if not store.session_space(session_id):
             threading.Thread(target=_file_quietly, args=(home, store, session_id), daemon=True).start()
