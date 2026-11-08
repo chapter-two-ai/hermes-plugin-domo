@@ -20,9 +20,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from . import search
+from . import memory, search
 
-KIND_WEIGHT = {"reply": 0.92, "run": 0.88, "routine-failed": 0.82, "idea": 0.8, "repo": 0.72, "todo": 0.62, "make-routine": 0.55}
+KIND_WEIGHT = {"habit": 0.86, "reply": 0.92, "run": 0.88, "routine-failed": 0.82, "idea": 0.8, "repo": 0.72, "todo": 0.62, "make-routine": 0.55}
 LIMIT = 8
 STOP = set("the a an and or to of in on for with at by from is are was be it this that these those i you we me my our your please "
            "can could would will should do does did have has had make get let just about what which when where how why there here "
@@ -207,11 +207,23 @@ def rank(found: list[dict], weights: dict[str, float], hidden: set[str], limit: 
 
 def build(home: Path, store, *, routines: list[dict], repos: list[dict], limit: int = LIMIT) -> list[dict]:
     chats = _chats(home)
-    found = _replies(chats) + _runs(store) + _failed_routines(routines) + _ideas(store) + _repos(repos) + _todos(store) + _repeats(chats, routines)
+    found = (_replies(chats) + _runs(store) + _failed_routines(routines) + _ideas(store) + memory.habits_due(store) + _repos(repos)
+             + _todos(store) + _repeats(chats, routines))
     return rank(found, store.kind_weights(), store.hidden_suggestions(), limit)
 
 
-def vote(store, key: str, kind: str, verdict: str, item: Optional[str] = None) -> None:
+def vote(store, key: str, kind: str, verdict: str, item: Optional[str] = None, title: str = "", instinct: Optional[str] = None) -> None:
     store.vote(key, kind, verdict)
     if item and verdict in ("done", "dismiss"):   # an idea the agent left is settled once acted on or turned down
         store.update(item, status="done" if verdict == "done" else "dismissed")
+    if instinct:   # a habit that was right gets surer; one that wasn't, less so
+        try:
+            if verdict in ("done", "more"):
+                pattern = store.instinct(instinct)["pattern"]
+                store.learn(pattern)
+            else:
+                store.weaken(instinct, 0.25 if verdict == "less" else 0.1)
+        except Exception:   # forgotten meanwhile
+            pass
+    words = {"done": "took", "dismiss": "set aside", "more": "wanted more like", "less": "wanted less like"}[verdict]
+    store.note("suggestion", f"{words} the {kind} suggestion “{title or key}”", ref=key)

@@ -162,7 +162,7 @@ def domo_fact(args: dict, session_id: str) -> str:
     store = current_store()
     if args.get("action") == "set":
         fact = store.set_fact(args.get("key", ""), args.get("value", ""), source=args.get("source", ""),
-                              space=args.get("space", ""))
+                              space=args.get("space", ""), origin=args.get("origin") or "stated")
     else:
         fact = store.get_fact(args.get("key", ""))
     return _ok(fact=fact)
@@ -178,6 +178,28 @@ def domo_suggest(args: dict, session_id: str) -> str:
     item = current_store().create("suggestion", title[:140], body=(args.get("because") or "").strip()[:240], space=args.get("space", ""),
                                   session_id=session_id, data={"prompt": prompt, "expires_at": time.time() + hours * 3600})
     return _ok(suggestion=_brief_item(item))
+
+
+@_guard
+def domo_memory(args: dict, session_id: str) -> str:
+    from . import memory
+    store = current_store()
+    action = args.get("action") or "recall"
+    if action == "recall":
+        return _ok(**memory.recall(store, since=float(args.get("since") or 0)))
+    if action == "learn":
+        return _ok(instinct=store.learn(args.get("pattern", ""), kind=args.get("kind") or "habit", origin=args.get("origin") or "inferred",
+                                        space=args.get("space", ""), prompt=args.get("prompt", ""), hours=str(args.get("hours") or ""),
+                                        days=str(args.get("days") or "")))
+    if action == "weaken":
+        return _ok(instinct=store.weaken(args.get("id", ""), float(args.get("by") or 0.2)))
+    if action == "synthesize":
+        for section, text in (args.get("sections") or {}).items():
+            store.set_synthesis(section, str(text))
+        return _ok(synthesis={k: v["text"] for k, v in store.synthesis().items()})
+    if action == "note":
+        return _ok(event=store.note("note", args.get("text", ""), ref=session_id or "", space=args.get("space", "")))
+    return _fail("action is recall, learn, weaken, synthesize or note")
 
 
 @_guard
@@ -238,8 +260,26 @@ TOOLS: list[tuple[str, dict, Callable[..., str], str]] = [
         ["text"]), domo_brief, "📰"),
     ("domo_fact", _schema(
         "domo_fact", "Save a stable fact (VAT number, address, contact) or look one up, so it is answered once.",
-        {"action": {"type": "string", "enum": ["set", "get"]}, "key": _S, "value": _S, "source": _S, "space": _SPACE},
+        {"action": {"type": "string", "enum": ["set", "get"]}, "key": _S, "value": _S, "source": _S, "space": _SPACE,
+         "origin": {"type": "string", "enum": ["stated", "inferred"], "description": "stated: they said it; inferred: you worked it out"}},
         ["action", "key"]), domo_fact, "📌"),
+    ("domo_memory", _schema(
+        "domo_memory",
+        "Domo's memory of this person, in layers. recall: the synthesis, instincts (patterns with confidence), facts and"
+        " recent events. learn: record a pattern you noticed (seen again, it gets surer; origin 'stated' when they told you);"
+        " a habit with prompt plus hours/days becomes a suggestion at that time. weaken: counter-evidence."
+        " synthesize: rewrite the short picture (sections who, now, preferences; under 80 words each). note: add to the trace.",
+        {"action": {"type": "string", "enum": ["recall", "learn", "weaken", "synthesize", "note"]},
+         "pattern": {"type": "string", "description": "learn: 'Reviews merged PRs on Monday mornings', 'Prefers pnpm over npm'"},
+         "kind": {"type": "string", "enum": ["habit", "preference", "avoid"]},
+         "origin": {"type": "string", "enum": ["stated", "inferred"]},
+         "prompt": {"type": "string", "description": "learn, habits: the message that starts it"},
+         "hours": {"type": "string", "description": "learn, habits: local hours like '8-10'"},
+         "days": {"type": "string", "description": "learn, habits: weekdays like '1-5' (0 is Sunday)"},
+         "id": {"type": "string", "description": "weaken: the instinct's id"}, "by": {"type": "number"},
+         "sections": {"type": "object", "description": "synthesize: {who, now, preferences}"},
+         "text": _S, "since": {"type": "number", "description": "recall: only events after this unix time"}, "space": _SPACE},
+        ["action"]), domo_memory, "🧠"),
     ("domo_suggest", _schema(
         "domo_suggest",
         "Leave the person a suggestion for the next time they open Domo: something prepared and ready to go"
@@ -263,6 +303,7 @@ PROMPT = (
     "- After you act, domo_receipt with proof and how to undo.\n"
     "- Facts people ask for again: domo_fact.\n"
     "- Check domo_open before asking something you may already have asked.\n"
+    "- When they tell you how they like things, or you see the same pattern twice, domo_memory learn it.\n"
     "- When you see something they will want to do next (a reply owed, a next step, a fix), prepare it and"
     " leave it with domo_suggest instead of saying 'let me know'."
 )

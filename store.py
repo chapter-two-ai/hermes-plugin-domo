@@ -71,6 +71,35 @@ CREATE TABLE IF NOT EXISTS session_spaces (
     space_id    TEXT NOT NULL,
     updated_at  REAL NOT NULL
 );
+-- Memory, in three layers (after DeepTutor): what happened, what's known, and what it adds up to.
+CREATE TABLE IF NOT EXISTS events (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    at     REAL NOT NULL,
+    kind   TEXT NOT NULL,
+    text   TEXT NOT NULL,
+    ref    TEXT NOT NULL DEFAULT '',
+    space  TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS instincts (
+    id          TEXT PRIMARY KEY,
+    pattern     TEXT NOT NULL,
+    norm        TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL DEFAULT 'habit',
+    confidence  REAL NOT NULL,
+    evidence    INTEGER NOT NULL DEFAULT 1,
+    origin      TEXT NOT NULL DEFAULT 'inferred',
+    space       TEXT NOT NULL DEFAULT '',
+    prompt      TEXT NOT NULL DEFAULT '',
+    hours       TEXT NOT NULL DEFAULT '',
+    days        TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS synthesis (
+    section     TEXT PRIMARY KEY,
+    text        TEXT NOT NULL,
+    updated_at  REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS suggestion_votes (
     key      TEXT NOT NULL,
     kind     TEXT NOT NULL,
@@ -106,8 +135,16 @@ SPACE_PRESETS = {
              "You're helping with work. Keep answers crisp and decision-ready, and track commitments as to-dos. "
              "Ask before sending anything to colleagues or clients."),
     "coding": ("code", "Code, repos and long coding runs on this Mac.",
-               "You're working on code. Work in the repo the person names and track long jobs with domo_run. "
-               "Commit on a branch, and ask before pushing or merging."),
+               "You're pairing on code. Work in the repo the person names, on a branch; track long jobs with domo_run; "
+               "ask before pushing or merging.\n"
+               "- Think first: say what you assume and what you'll change before you change it; ask when it's ambiguous.\n"
+               "- Keep it simple: the smallest change that does the job, in the code's own style; no extras nobody asked for.\n"
+               "- Touch only what the task needs; leave unrelated code alone, and say what you noticed instead.\n"
+               "- Done means proven: run the tests or the program and show the result before you say it works.\n"
+               "Method, when it fits: brainstorming then writing-plans for anything new, systematic-debugging for bugs, "
+               "test-driven-development for logic, verification-before-completion before you report, "
+               "to-questionnaire when they must choose, handoff when the chat gets long, archify to explain a system, "
+               "impeccable for interface work."),
     "personal": ("leaf", "Health, errands, money and everything that's just yours.",
                  "You're helping with personal life. Be warm and brief, keep private things private, "
                  "and turn loose ends into to-dos."),
@@ -129,6 +166,9 @@ SPACE_PRESETS = {
 }
 
 
+SYNTHESIS_SECTIONS = ("who", "now", "preferences")
+
+
 class StoreError(ValueError):
     """A request the store refuses (unknown item, wrong kind, bad status)."""
 
@@ -148,6 +188,10 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA busy_timeout=5000")
         self._db.executescript(_SCHEMA)
+        try:   # stores from before facts knew whether they were said or guessed
+            self._db.execute("ALTER TABLE facts ADD COLUMN origin TEXT NOT NULL DEFAULT 'stated'")
+        except sqlite3.OperationalError:
+            pass
 
     def close(self) -> None:
         self._db.close()
@@ -296,17 +340,104 @@ class Store:
 
     # ---- facts -------------------------------------------------------------------------------
 
-    def set_fact(self, key: str, value: str, *, source: str = "", space: str = "") -> dict:
+    def set_fact(self, key: str, value: str, *, source: str = "", space: str = "", origin: str = "stated") -> dict:
+        """``origin``: 'stated' when the person said it, 'inferred' when Domo worked it out (after Graphify)."""
         key = _fact_key(key)
         if not value:
             raise StoreError("value is required")
+        if origin not in ("stated", "inferred"):
+            raise StoreError("origin is stated or inferred")
         with self._tx() as db:
             db.execute(
-                "INSERT INTO facts (key, value, source, space, updated_at) VALUES (?,?,?,?,?)"
+                "INSERT INTO facts (key, value, source, space, origin, updated_at) VALUES (?,?,?,?,?,?)"
                 " ON CONFLICT(key) DO UPDATE SET value=excluded.value, source=excluded.source,"
-                " space=excluded.space, updated_at=excluded.updated_at",
-                (key, value, source, space, self._clock()))
+                " space=excluded.space, origin=excluded.origin, updated_at=excluded.updated_at",
+                (key, value, source, space, origin, self._clock()))
         return self.get_fact(key, count=False)
+
+    def forget_fact(self, key: str) -> None:
+        with self._tx() as db:
+            db.execute("DELETE FROM facts WHERE key = ?", (_fact_key(key),))
+
+    # ---- memory: events, instincts, synthesis -----------------------------------------------
+
+    def note(self, kind: str, text: str, *, ref: str = "", space: str = "") -> dict:
+        """The trace: append-only, so a later consolidation can always go back to what happened."""
+        text = " ".join((text or "").split())[:400]
+        if not text:
+            raise StoreError("text is required")
+        with self._tx() as db:
+            cur = db.execute("INSERT INTO events (at, kind, text, ref, space) VALUES (?,?,?,?,?)", (self._clock(), kind, text, ref, space))
+        return dict(self._db.execute("SELECT * FROM events WHERE id = ?", (cur.lastrowid,)).fetchone())
+
+    def events(self, *, since: float = 0, limit: int = 100) -> list[dict]:
+        rows = self._db.execute("SELECT * FROM events WHERE at > ? ORDER BY id DESC LIMIT ?", (since, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def learn(self, pattern: str, *, kind: str = "habit", origin: str = "inferred", space: str = "", prompt: str = "",
+              hours: str = "", days: str = "") -> dict:
+        """An instinct (after ECC): a pattern with a confidence that evidence raises and feedback lowers.
+        Seen again, it gets stronger; told by the person, it starts strong."""
+        pattern = " ".join((pattern or "").split())[:240]
+        if not pattern:
+            raise StoreError("pattern is required")
+        if kind not in ("habit", "preference", "avoid"):
+            raise StoreError("kind is habit, preference or avoid")
+        norm = _fact_key(pattern)
+        now = self._clock()
+        row = self._db.execute("SELECT * FROM instincts WHERE norm = ?", (norm,)).fetchone()
+        with self._tx() as db:
+            if row:
+                origin = "stated" if "stated" in (origin, row["origin"]) else "inferred"
+                db.execute("UPDATE instincts SET confidence = MIN(0.95, confidence + 0.1), evidence = evidence + 1, origin = ?,"
+                           " prompt = COALESCE(NULLIF(?, ''), prompt), hours = COALESCE(NULLIF(?, ''), hours),"
+                           " days = COALESCE(NULLIF(?, ''), days), space = COALESCE(NULLIF(?, ''), space), updated_at = ? WHERE id = ?",
+                           (origin, prompt, hours, days, space, now, row["id"]))
+                iid = row["id"]
+            else:
+                iid = f"in_{uuid.uuid4().hex[:12]}"
+                db.execute("INSERT INTO instincts (id, pattern, norm, kind, confidence, origin, space, prompt, hours, days, created_at, updated_at)"
+                           " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (iid, pattern, norm, kind, 0.8 if origin == "stated" else 0.35, origin, space, prompt, hours, days, now, now))
+        return self.instinct(iid)
+
+    def instinct(self, instinct_id: str) -> dict:
+        row = self._db.execute("SELECT * FROM instincts WHERE id = ?", (instinct_id,)).fetchone()
+        if row is None:
+            raise StoreError(f"no instinct {instinct_id!r}")
+        return dict(row)
+
+    def weaken(self, instinct_id: str, by: float = 0.2) -> dict:
+        """Counter-evidence or a 'less like this'; below 0.1 it's gone."""
+        current = self.instinct(instinct_id)
+        with self._tx() as db:
+            if current["confidence"] - by < 0.1:
+                db.execute("DELETE FROM instincts WHERE id = ?", (instinct_id,))
+                return {**current, "confidence": 0.0, "forgotten": True}
+            db.execute("UPDATE instincts SET confidence = confidence - ?, updated_at = ? WHERE id = ?", (by, self._clock(), instinct_id))
+        return self.instinct(instinct_id)
+
+    def forget_instinct(self, instinct_id: str) -> None:
+        with self._tx() as db:
+            db.execute("DELETE FROM instincts WHERE id = ?", (instinct_id,))
+
+    def instincts(self, *, at_least: float = 0.0) -> list[dict]:
+        rows = self._db.execute("SELECT * FROM instincts WHERE confidence >= ? ORDER BY confidence DESC, updated_at DESC", (at_least,))
+        return [dict(r) for r in rows]
+
+    def set_synthesis(self, section: str, text: str) -> None:
+        """The top layer: a short, rewritten picture of the person (who, now, preferences)."""
+        if section not in SYNTHESIS_SECTIONS:
+            raise StoreError(f"section is one of {', '.join(SYNTHESIS_SECTIONS)}")
+        with self._tx() as db:
+            if text.strip():
+                db.execute("INSERT INTO synthesis (section, text, updated_at) VALUES (?,?,?) ON CONFLICT(section)"
+                           " DO UPDATE SET text=excluded.text, updated_at=excluded.updated_at", (section, text.strip()[:1200], self._clock()))
+            else:
+                db.execute("DELETE FROM synthesis WHERE section = ?", (section,))
+
+    def synthesis(self) -> dict[str, dict]:
+        return {r["section"]: dict(r) for r in self._db.execute("SELECT * FROM synthesis")}
 
     def get_fact(self, key: str, *, count: bool = True) -> dict:
         """Look a fact up. ``count`` records that someone had to ask again (a memory miss)."""

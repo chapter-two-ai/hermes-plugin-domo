@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import bridge, files as attach, repos as repo_scan, rtk, search as chat_search, suggest  # noqa: E402
+from domo import bridge, files as attach, memory, repos as repo_scan, rtk, search as chat_search, suggest  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -155,7 +155,10 @@ def patch_item(item_id: str, patch: ItemPatch, profile: str = Query(bridge.DEFAU
     item = _store_call(store.get, item_id)
     if item["kind"] not in ("todo", "receipt"):
         raise HTTPException(400, "only to-dos and receipts change status here; answer decisions instead")
-    return _store_call(store.update, item_id, status=patch.status)
+    updated = _store_call(store.update, item_id, status=patch.status)
+    if item["kind"] == "todo" and patch.status == "done":
+        store.note("todo", f"did “{item['title']}”", ref=item_id, space=item["space"])
+    return updated
 
 
 class Answer(BaseModel):
@@ -168,6 +171,7 @@ class Answer(BaseModel):
 def answer(decision_id: str, body: Answer, background: BackgroundTasks, profile: str = Query(bridge.DEFAULT, alias="agent")):
     store = _store(profile)
     item = _store_call(store.answer, decision_id, body.choice, note=body.note, by=body.by)
+    store.note("decision", f"answered “{item['title']}” with {body.choice}" + (f" ({body.note})" if body.note else ""), ref=decision_id, space=item["space"])
     item = store.update(decision_id, data={"resume": "queued"})
     background.add_task(_resume_agent, profile, decision_id)
     return item
@@ -440,15 +444,60 @@ class VoteIn(BaseModel):
     kind: str
     verdict: str
     item: str | None = None
+    title: str = ""
+    instinct: str | None = None
 
 
 @router.post("/suggestions/vote")
 def vote(body: VoteIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
     try:
-        suggest.vote(_store(profile), body.key, body.kind, body.verdict, body.item)
+        suggest.vote(_store(profile), body.key, body.kind, body.verdict, body.item, body.title, body.instinct)
     except StoreError as exc:
         raise HTTPException(400, str(exc))
     return {"ok": True}
+
+
+@router.get("/memory")
+def get_memory(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Everything Domo remembers about this person, for the Memory screen."""
+    return memory.recall(_store(profile), events=60)
+
+
+class SynthesisIn(BaseModel):
+    text: str
+
+
+@router.put("/memory/synthesis/{section}")
+def put_synthesis(section: str, body: SynthesisIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    store = _store(profile)
+    _store_call(store.set_synthesis, section, body.text)
+    return {k: v["text"] for k, v in store.synthesis().items()}
+
+
+class InstinctIn(BaseModel):
+    pattern: str
+    kind: str = "preference"
+
+
+@router.post("/memory/instincts", status_code=201)
+def teach(body: InstinctIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Told by the person: it starts strong."""
+    return _store_call(_store(profile).learn, body.pattern, kind=body.kind, origin="stated")
+
+
+@router.post("/memory/instincts/{instinct_id}/weaken")
+def weaken(instinct_id: str, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    return _store_call(_store(profile).weaken, instinct_id, 0.2)
+
+
+@router.delete("/memory/instincts/{instinct_id}", status_code=204)
+def forget_instinct(instinct_id: str, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    _store(profile).forget_instinct(instinct_id)
+
+
+@router.delete("/memory/facts/{key}", status_code=204)
+def forget_fact(key: str, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    _store_call(_store(profile).forget_fact, key)
 
 
 @router.get("/search/status")
@@ -550,8 +599,13 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
     space = store.space(tag["space_id"]) if tag else None
     payload = {"message": content}
     instructions = [_space_instructions(space)] if space else []
+    known = memory.for_prompt(store)
+    if known:
+        instructions.append(known)
     if body.mode == "plan":
         instructions.append(PLAN_MODE)
+    if body.message.strip():
+        store.note("asked", body.message.strip()[:160], ref=session_id, space=space["name"] if space else "")
     if instructions:
         payload["instructions"] = "\n\n".join(instructions)
     for f in found:
