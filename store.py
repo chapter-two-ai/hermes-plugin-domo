@@ -71,6 +71,10 @@ CREATE TABLE IF NOT EXISTS session_spaces (
     space_id    TEXT NOT NULL,
     updated_at  REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS archived_sessions (
+    session_id   TEXT PRIMARY KEY,
+    archived_at  REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS job_spaces (
     job_id    TEXT PRIMARY KEY,
     space_id  TEXT NOT NULL
@@ -444,6 +448,18 @@ class Store:
     def session_space(self, session_id: str) -> Optional[dict]:
         row = self._db.execute("SELECT * FROM session_spaces WHERE session_id = ?", (session_id,)).fetchone()
         return dict(row) if row else None
+
+    def set_archived(self, session_id: str, archived: bool) -> None:
+        """Remember what was archived here: Hermes's own listing leaves archived chats out entirely."""
+        with self._tx() as db:
+            if archived:
+                db.execute("INSERT OR REPLACE INTO archived_sessions (session_id, archived_at) VALUES (?, ?)",
+                           (session_id, self._clock()))
+            else:
+                db.execute("DELETE FROM archived_sessions WHERE session_id = ?", (session_id,))
+
+    def archived(self) -> list[str]:
+        return [r[0] for r in self._db.execute("SELECT session_id FROM archived_sessions ORDER BY archived_at DESC")]
 
     def session_tags(self) -> dict[str, str]:
         return {r[0]: r[1] for r in self._db.execute("SELECT session_id, space_id FROM session_spaces")}

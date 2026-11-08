@@ -7,6 +7,7 @@ through to that profile's API server over loopback, with the space each is filed
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -21,7 +22,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import bridge, files as attach, repos as repo_scan, rtk  # noqa: E402
+from domo import bridge, files as attach, repos as repo_scan, rtk, search as chat_search  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -113,6 +114,7 @@ def profiles():
 
 @router.get("/feed")
 def feed(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    chat_search.ensure_running()
     store = _store(profile)
     return {"profile": bridge.profile_info(profile), **store.feed()}
 
@@ -392,13 +394,70 @@ async def _kick_off(profile: str, run_id: str, session_id: str, repo: dict, prom
 
 # ---- chat, sessions and routines (passed through to the API server) ----------------------------
 
+@router.get("/search")
+async def search(q: str = "", profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(20, ge=1, le=50),
+                 space_id: Optional[str] = None):
+    """Every chat of this agent, by words and by meaning: one row per chat, its best matching message."""
+    chat_search.ensure_running()
+    _home(profile)
+    store = _store(profile)
+    tags = store.session_tags()
+    only = {sid for sid, sp in tags.items() if sp == space_id} if space_id else None
+    found = await asyncio.to_thread(chat_search.search, profile, q, limit=limit, sessions=only)
+    for row in found["results"]:
+        row["space_id"] = tags.get(row["session_id"])
+    return found
+
+
+@router.get("/search/status")
+def search_status(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    chat_search.ensure_running()
+    _home(profile)
+    return chat_search.status(profile)
+
+
 @router.get("/sessions")
-async def sessions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(30, ge=1, le=200)):
-    tags = _store(profile).session_tags()
-    listing = await _passthrough(profile, "GET", "/api/sessions", params={"limit": limit})
+async def sessions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(30, ge=1, le=200),
+                   archived: bool = False):
+    store = _store(profile)
+    tags = store.session_tags()
+    if archived:
+        listing = {"object": "list", "data": await _archived_sessions(profile, store)}
+    else:
+        listing = await _passthrough(profile, "GET", "/api/sessions", params={"limit": limit})
     for row in _rows(listing, "data", "sessions"):
         row["space_id"] = tags.get(row.get("id"))
     return listing
+
+
+async def _archived_sessions(profile: str, store) -> list[dict]:
+    """Chats archived from the app, newest first, read one by one: Hermes lists no archived chats."""
+    async def one(sid: str):
+        try:
+            got = await _passthrough(profile, "GET", f"/api/sessions/{sid}")
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                store.set_archived(sid, False)   # deleted since
+            return None
+        row = got.get("session", got)
+        if row.get("archived") is False:   # unarchived elsewhere (Hermes's own desktop app)
+            store.set_archived(sid, False)
+            return None
+        return row
+    rows = await asyncio.gather(*(one(sid) for sid in store.archived()[:200]))
+    return [r for r in rows if r]
+
+
+class ArchiveIn(BaseModel):
+    archived: bool = True
+
+
+@router.put("/sessions/{session_id}/archive")
+async def archive_session(session_id: str, body: ArchiveIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Archive a chat (or bring it back) with Hermes's own flag, the one its desktop sidebar uses."""
+    await _passthrough(profile, "PATCH", f"/api/sessions/{session_id}", body={"archived": body.archived})
+    _store(profile).set_archived(session_id, body.archived)
+    return {"session_id": session_id, "archived": body.archived}
 
 
 class NewSession(BaseModel):
