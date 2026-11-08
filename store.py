@@ -169,6 +169,44 @@ SPACE_PRESETS = {
 SYNTHESIS_SECTIONS = ("who", "now", "preferences")
 
 
+class _Rows(list):
+    """A statement's rows, already fetched: safe to read after the lock is released."""
+
+    def __init__(self, rows, lastrowid, rowcount):
+        super().__init__(rows)
+        self.lastrowid, self.rowcount = lastrowid, rowcount
+
+    def fetchone(self):
+        return self[0] if self else None
+
+    def fetchall(self):
+        return list(self)
+
+
+class _Locked:
+    """sqlite3.Connection, one statement at a time across threads."""
+
+    def __init__(self, conn: sqlite3.Connection, lock):
+        self._conn, self._lock = conn, lock
+
+    def execute(self, sql: str, params=()) -> _Rows:
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            return _Rows(cur.fetchall(), cur.lastrowid, cur.rowcount)
+
+    def executemany(self, sql: str, seq) -> _Rows:
+        with self._lock:
+            cur = self._conn.executemany(sql, seq)
+            return _Rows([], cur.lastrowid, cur.rowcount)
+
+    def executescript(self, script: str):
+        with self._lock:
+            return self._conn.executescript(script)
+
+    def close(self):
+        self._conn.close()
+
+
 class StoreError(ValueError):
     """A request the store refuses (unknown item, wrong kind, bad status)."""
 
@@ -182,9 +220,12 @@ class Store:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock
-        self._lock = threading.Lock()
-        self._db = sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
-        self._db.row_factory = sqlite3.Row
+        # One connection, used from request threads and background ones (the filer, the indexer): every
+        # statement holds the lock, and its rows are read before it lets go.
+        self._lock = threading.RLock()
+        conn = sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        self._db = _Locked(conn, self._lock)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA busy_timeout=5000")
         self._db.executescript(_SCHEMA)
@@ -206,7 +247,8 @@ class Store:
         self._db.execute("CREATE TABLE IF NOT EXISTS filing_attempts (session_id TEXT PRIMARY KEY, at REAL NOT NULL, revision INTEGER NOT NULL DEFAULT 0)")
 
     def close(self) -> None:
-        self._db.close()
+        with self._lock:
+            self._db.close()
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:

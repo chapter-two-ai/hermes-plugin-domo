@@ -589,11 +589,41 @@ async def archive_session(session_id: str, body: ArchiveIn, profile: str = Query
 
 class NewSession(BaseModel):
     title: str = ""
+    model: str | None = None
+    provider: str | None = None
 
 
 @router.post("/sessions")
 async def new_session(body: NewSession, profile: str = Query(bridge.DEFAULT, alias="agent")):
-    return await _passthrough(profile, "POST", "/api/sessions", body={"title": body.title} if body.title else {})
+    payload = {"title": body.title} if body.title else {}
+    if body.model:   # a chat started on a chosen model keeps it (Hermes stores it on the session)
+        payload.update({"model": body.model, **({"provider": body.provider} if body.provider else {})})
+    return await _passthrough(profile, "POST", "/api/sessions", body=payload)
+
+
+_FAMILY = re.compile(r"(opus|sonnet|haiku)", re.I)
+
+
+def _version(model_id: str) -> tuple:
+    """claude-opus-5-5 > claude-opus-5 > claude-opus-4-8; dated snapshots after their family's newest."""
+    nums = [int(n) for n in re.findall(r"(?<![0-9])(\d{1,2})(?![0-9])", model_id)]
+    return (tuple(nums), -len(model_id))
+
+
+@router.get("/models")
+async def models(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """The models this agent's provider offers, and the newest Opus, Sonnet and Haiku among them, for
+    the one-click switch on a new chat."""
+    options = await _passthrough(profile, "GET", "/api/model/options")
+    providers = options.get("providers") or []
+    current = next((p for p in providers if p.get("is_current")), providers[0] if providers else {})
+    ids = [m if isinstance(m, str) else m.get("id", "") for m in current.get("models") or []]
+    families: dict[str, str] = {}
+    for fam in ("opus", "sonnet", "haiku"):
+        pick = sorted((i for i in ids if fam in i.lower()), key=_version, reverse=True)
+        if pick:
+            families[fam] = pick[0]
+    return {"provider": current.get("slug") or options.get("provider"), "model": options.get("model"), "families": families, "models": ids}
 
 
 @router.get("/sessions/{session_id}/messages")
@@ -607,6 +637,8 @@ class ChatIn(BaseModel):
     attachments: list[str] = []   # paths returned by POST /files
     space_id: str | None = None  # files the chat under this space first
     mode: str | None = None   # "plan": investigate and propose, change nothing
+    model: str | None = None   # this turn and the ones after it, on this model (Hermes's model lock)
+    provider: str | None = None
 
 
 @router.put("/sessions/{session_id}/space")
@@ -635,6 +667,8 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
     space = store.space(tag["space_id"]) if tag and tag["space_id"] else None
     parent = store.space(space["parent_id"]) if space and space.get("parent_id") else None
     payload = {"message": content}
+    if body.model:   # locked, so it holds: a bare model only counts on a session's first turn
+        payload.update({"model": body.model, "require_model_lock": True, **({"provider": body.provider} if body.provider else {})})
     instructions = [_space_instructions(space, parent)] if space else []
     known = memory.for_prompt(store)
     if known:
