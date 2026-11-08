@@ -268,7 +268,8 @@ TOOLS: list[tuple[str, dict, Callable[..., str], str]] = [
         "Domo's memory of this person, in layers. recall: the synthesis, instincts (patterns with confidence), facts and"
         " recent events. learn: record a pattern you noticed (seen again, it gets surer; origin 'stated' when they told you);"
         " a habit with prompt plus hours/days becomes a suggestion at that time. weaken: counter-evidence."
-        " synthesize: rewrite the short picture (sections who, now, preferences; under 80 words each). note: add to the trace.",
+        " synthesize: rewrite the short picture (sections who, now, preferences; under 80 words each), as facts, not commands"
+        " ('Prefers short answers', not 'Always be short'). note: add to the trace.",
         {"action": {"type": "string", "enum": ["recall", "learn", "weaken", "synthesize", "note"]},
          "pattern": {"type": "string", "description": "learn: 'Reviews merged PRs on Monday mornings', 'Prefers pnpm over npm'"},
          "kind": {"type": "string", "enum": ["habit", "preference", "avoid"]},
