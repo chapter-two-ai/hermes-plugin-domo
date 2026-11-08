@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +23,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import bridge, files as attach, memory, repos as repo_scan, rtk, search as chat_search, suggest  # noqa: E402
+from domo import bridge, filing, files as attach, memory, repos as repo_scan, rtk, search as chat_search, suggest  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -238,6 +239,7 @@ class SpaceIn(BaseModel):
     color: str = Field("", pattern=_COLOR)
     description: str = ""
     prompt: str = ""
+    parent_id: str | None = None   # a sub-space: Work › Baltazar
 
 
 class SpacePatch(BaseModel):
@@ -284,10 +286,13 @@ async def space_detail(space_id: str, profile: str = Query(bridge.DEFAULT, alias
     store = _store(profile)
     space = _space_or_404(store, space_id)
     tags, job_tags = store.session_tags(), store.job_tags()
+    children = store.children(space_id)
+    # a space's chats include its sub-spaces' chats, each saying where it's filed
+    inside = {space_id, *(c["id"] for c in children)}
     try:
         sessions = _rows(await _passthrough(profile, "GET", "/api/sessions", params={"limit": 200}), "data", "sessions")
     except HTTPException:
-        sessions = [{"id": sid} for sid, tagged in tags.items() if tagged == space_id]
+        sessions = [{"id": sid} for sid, tagged in tags.items() if tagged in inside]
     try:
         jobs = _rows(await _passthrough(profile, "GET", "/api/jobs"), "jobs")
     except HTTPException:
@@ -300,10 +305,18 @@ async def space_detail(space_id: str, profile: str = Query(bridge.DEFAULT, alias
         if match and match["job"] in job_ids:
             runs.append({**_chat(s), "job_id": job_ids[match["job"]]})
     run_ids = {r["id"] for r in runs}
-    chats = [_chat(s) for s in sessions
-             if tags.get(s.get("id")) == space_id or (s.get("id") in run_ids and not tags.get(s.get("id")))]
-    return {"space": space, "chats": _newest(chats), "files": store.files(space_id), "routines": routines,
-            "runs": _newest(runs)[:10], "items": store.space_items(space_id)}
+    filings = store.filings()
+    chats = [{**_chat(s), "space_id": tags.get(s.get("id")), **_filed(filings.get(s.get("id")))} for s in sessions
+             if tags.get(s.get("id")) in inside or (s.get("id") in run_ids and not tags.get(s.get("id")))]
+    return {"space": space, "lineage": store.lineage(space_id), "children": children, "chats": _newest(chats),
+            "files": store.files(space_id), "routines": routines, "runs": _newest(runs)[:10], "items": store.space_items(space_id)}
+
+
+def _filed(f: Optional[dict]) -> dict:
+    """Who filed a chat where it is: the person, or Domo (how sure, and why)."""
+    if not f or not f["space_id"]:
+        return {}
+    return {"filed_by": f["filed_by"], "filing_confidence": f["confidence"], "filing_reason": f["reason"]}
 
 
 def _rows(payload, *keys: str) -> list[dict]:
@@ -339,10 +352,15 @@ PLAN_MODE = ("[Plan mode] Investigate and propose; change nothing. Read files, s
              " worked. Don't edit files, run anything that writes, commit, push or message anyone until they say go.")
 
 
-def _space_instructions(space: dict) -> str:
+def _space_instructions(space: dict, parent: Optional[dict] = None) -> str:
     """A chat in a space works the space's way: its name and prompt go to Hermes as this turn's extra
     system prompt (the API's ``instructions``), so they never become part of the message, its history or
-    the chat's title, and an edited prompt applies from the next turn."""
+    the chat's title, and an edited prompt applies from the next turn. A sub-space adds its own to its
+    parent's: Work's way of working, then what's particular to Baltazar."""
+    if parent:
+        head = f"[Domo space: {parent['name']} › {space['name']}]"
+        parts = [parent["prompt"], space["description"] and f"This chat is about {space['name']}: {space['description']}", space["prompt"]]
+        return head + "".join(f"\n{p}" for p in parts if p)
     return f"[Domo space: {space['name']}]" + (f"\n{space['prompt']}" if space["prompt"] else "")
 
 
@@ -516,9 +534,27 @@ async def sessions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit: i
         listing = {"object": "list", "data": await _archived_sessions(profile, store)}
     else:
         listing = await _passthrough(profile, "GET", "/api/sessions", params={"limit": limit})
+    filings = store.filings()
     for row in _rows(listing, "data", "sessions"):
         row["space_id"] = tags.get(row.get("id"))
+        row.update(_filed(filings.get(row.get("id"))))
     return listing
+
+
+class FileIn(BaseModel):
+    session_id: str | None = None   # one chat; without it, a sweep of everything unfiled
+
+
+@router.post("/filing")
+async def file_now(body: FileIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Work out where chats belong now (the routine does this on its own): one, or all that are unfiled."""
+    home, store = _home(profile), _store(profile)
+    if not filing.jev_key():
+        raise HTTPException(503, "Filing needs TYPESAFE_API_KEY in the agent's environment")
+    if body.session_id:
+        done = await asyncio.to_thread(filing.file_session, home, store, body.session_id)
+        return {"filed": [done] if done else []}
+    return {"filed": await asyncio.to_thread(filing.sweep, home, store)}
 
 
 async def _archived_sessions(profile: str, store) -> list[dict]:
@@ -596,9 +632,10 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
     api = _api(profile)
     content = attach.compose(body.message, found)
     tag = store.session_space(session_id)
-    space = store.space(tag["space_id"]) if tag else None
+    space = store.space(tag["space_id"]) if tag and tag["space_id"] else None
+    parent = store.space(space["parent_id"]) if space and space.get("parent_id") else None
     payload = {"message": content}
-    instructions = [_space_instructions(space)] if space else []
+    instructions = [_space_instructions(space, parent)] if space else []
     known = memory.for_prompt(store)
     if known:
         instructions.append(known)
@@ -610,8 +647,21 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
         payload["instructions"] = "\n\n".join(instructions)
     for f in found:
         store.link_file(f["path"], session_id=session_id, space_id=space and space["id"])
-    return StreamingResponse(api.stream(f"/api/sessions/{session_id}/chat/stream", payload),
-                             media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    async def then_file():
+        async for chunk in api.stream(f"/api/sessions/{session_id}/chat/stream", payload):
+            yield chunk
+        # just started chatting, with no space: Domo works out where it belongs, off the request
+        if not store.session_space(session_id):
+            threading.Thread(target=_file_quietly, args=(home, store, session_id), daemon=True).start()
+
+    return StreamingResponse(then_file(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+def _file_quietly(home: Path, store: Store, session_id: str) -> None:
+    try:
+        filing.after_turn(home, store, session_id)
+    except Exception:   # filing is a nicety: a chat never fails for it
+        log.exception("filing %s", session_id)
 
 
 # ---- files ------------------------------------------------------------------------------------
