@@ -16,17 +16,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import bridge, files as attach, memory, repos as repo_scan, rtk, search as chat_search, suggest  # noqa: E402
+from domo import access, bridge, files as attach, memory, repos as repo_scan, rtk, search as chat_search, suggest  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(access.guard)])
 VERSION = "0.1.0"
 INBOX_TITLE = "Domo inbox"
 RUN_TITLE = re.compile(r"^(?P<job>.+) · [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}$")  # "<job name> · Nov 08 00:00"
@@ -92,9 +92,12 @@ async def _passthrough(profile: str, method: str, path: str, *, body: Optional[d
 # ---- meta -------------------------------------------------------------------------------------
 
 @router.get("/health")
-async def health():
+async def health(request: Request):
+    allowed = access.allowed_profiles(request)
     profiles = []
     for name in bridge.profile_names():
+        if allowed is not None and name not in allowed:
+            continue
         entry = {**bridge.profile_info(name), "api_server": "unknown", "rtk": "on" if rtk.available() else "off"}
         try:
             response = await _api(name).request("GET", "/health", timeout=3.0)
@@ -106,8 +109,9 @@ async def health():
 
 
 @router.get("/profiles")
-def profiles():
-    return {"profiles": [bridge.profile_info(n) for n in bridge.profile_names()]}
+def profiles(request: Request):
+    allowed = access.allowed_profiles(request)
+    return {"profiles": [bridge.profile_info(n) for n in bridge.profile_names() if allowed is None or n in allowed]}
 
 
 # ---- Domo items -------------------------------------------------------------------------------
