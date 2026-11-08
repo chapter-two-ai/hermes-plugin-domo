@@ -115,6 +115,21 @@ CREATE TABLE IF NOT EXISTS job_spaces (
     job_id    TEXT PRIMARY KEY,
     space_id  TEXT NOT NULL
 );
+-- Spaces as tags: a chat (or a file, routine, item) can be in an area and in any topics, each tag saying
+-- who put it there and how sure Domo was. state 'off' is a tag the person took away: Domo leaves it off.
+CREATE TABLE IF NOT EXISTS space_links (
+    space_id     TEXT NOT NULL,
+    target_type  TEXT NOT NULL,
+    target_id    TEXT NOT NULL,
+    by           TEXT NOT NULL DEFAULT 'person',
+    confidence   REAL,
+    reason       TEXT NOT NULL DEFAULT '',
+    state        TEXT NOT NULL DEFAULT 'on',
+    at           REAL NOT NULL,
+    PRIMARY KEY (space_id, target_type, target_id)
+);
+CREATE INDEX IF NOT EXISTS space_links_target ON space_links(target_type, target_id);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS files (
     path        TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
@@ -126,7 +141,9 @@ CREATE TABLE IF NOT EXISTS files (
 );
 """
 
-SPACE_FIELDS = ("id", "name", "icon", "color", "description", "prompt", "created_at", "updated_at", "parent_id", "origin")
+SPACE_FIELDS = ("id", "name", "icon", "color", "description", "prompt", "created_at", "updated_at", "parent_id", "origin", "kind", "quiet")
+KINDS_OF_SPACE = ("area", "topic")
+TARGETS = ("session", "file", "job", "item")
 PALETTE = ("#4CC9F0", "#FF6B2C", "#3DD68C", "#FF2D8A", "#FFB020", "#2F5BFF")   # the brand spectrum (docs/BRAND.md §3.2)
 
 # Seeded spaces: icon, description, and the prompt the agent gets when a chat starts in the space.
@@ -239,12 +256,17 @@ class Store:
             "ALTER TABLE session_spaces ADD COLUMN filed_by TEXT NOT NULL DEFAULT 'person'",
             "ALTER TABLE session_spaces ADD COLUMN confidence REAL",
             "ALTER TABLE session_spaces ADD COLUMN reason TEXT NOT NULL DEFAULT ''",
+            # areas (a few, the person's) and topics (many, mostly Domo's); quiet ones fade from view
+            "ALTER TABLE spaces ADD COLUMN kind TEXT NOT NULL DEFAULT 'area'",
+            "ALTER TABLE spaces ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE spaces ADD COLUMN aliases TEXT NOT NULL DEFAULT '[]'",
         ):
             try:
                 self._db.execute(sql)
             except sqlite3.OperationalError:
                 pass   # already there
         self._db.execute("CREATE TABLE IF NOT EXISTS filing_attempts (session_id TEXT PRIMARY KEY, at REAL NOT NULL, revision INTEGER NOT NULL DEFAULT 0)")
+        self._migrate_to_tags()
 
     def close(self) -> None:
         with self._lock:
@@ -522,28 +544,27 @@ class Store:
                                             description=description, prompt=prompt))
         return seeded
 
-    def spaces(self) -> list[dict]:
-        """Every space with its counts, parents before their sub-spaces, adopting space names items use
-        that have no record yet."""
+    def spaces(self, *, include_quiet: bool = True) -> list[dict]:
+        """Areas first (in their order), then topics, most recently active first; each with its counts.
+        Adopts space names items use that have no record yet."""
         known = {k for r in self._db.execute("SELECT id, name FROM spaces") for k in (r["id"], r["name"].lower())}
         for (name,) in self._db.execute("SELECT DISTINCT space FROM items WHERE space != ''").fetchall():
             if name.lower() not in known:
                 known.update((self.create_space(name)["id"], name.lower()))
         rows = self._db.execute("SELECT * FROM spaces ORDER BY position, name").fetchall()
-        tops = [r for r in rows if not r["parent_id"]]
-        kids = {}
-        for r in rows:
-            if r["parent_id"]:
-                kids.setdefault(r["parent_id"], []).append(r)
-        ordered = [x for t in tops for x in (t, *sorted(kids.get(t["id"], []), key=lambda k: k["name"].lower()))]
-        return [{**_space(r), "counts": self._space_counts(r)} for r in ordered]
+        last = {r[0]: r[1] for r in self._db.execute("SELECT space_id, MAX(at) FROM space_links WHERE state = 'on' GROUP BY space_id")}
+        out = [{**_space(r), "counts": self._space_counts(r), "last_active": last.get(r["id"])} for r in rows if include_quiet or not r["quiet"]]
+        areas = [x for x in out if x["kind"] == "area"]
+        topics = sorted((x for x in out if x["kind"] == "topic"), key=lambda x: -(x["last_active"] or x["updated_at"] or 0))
+        return areas + topics
 
     def children(self, space_id: str) -> list[dict]:
-        rows = self._db.execute("SELECT * FROM spaces WHERE parent_id = ? ORDER BY name", (space_id,)).fetchall()
+        """An area's topics: the ones whose chats are mostly in it."""
+        rows = self._db.execute("SELECT * FROM spaces WHERE parent_id = ? AND kind = 'topic' ORDER BY name", (space_id,)).fetchall()
         return [{**_space(r), "counts": self._space_counts(r)} for r in rows]
 
     def lineage(self, space_id: str) -> list[dict]:
-        """The space and its parent, outermost first: [Work, Baltazar]."""
+        """The space and its home area, outermost first: [Work, Baltazar]."""
         s = self.space(space_id)
         if not s:
             return []
@@ -555,51 +576,55 @@ class Store:
         return _space(row) if row else None
 
     def _space_counts(self, row: sqlite3.Row) -> dict:
-        one = lambda sql, *a: self._db.execute(sql, a).fetchone()[0]  # noqa: E731
-        return {"chats": one("SELECT COUNT(*) FROM session_spaces WHERE space_id = ?", row["id"]),
-                "files": one("SELECT COUNT(*) FROM files WHERE space_id = ?", row["id"]),
-                "routines": one("SELECT COUNT(*) FROM job_spaces WHERE space_id = ?", row["id"]),
-                "open": len(self.space_items(row["id"]))}
+        n = lambda t: self._db.execute("SELECT COUNT(*) FROM space_links WHERE space_id = ? AND target_type = ? AND state = 'on'", (row["id"], t)).fetchone()[0]  # noqa: E731
+        return {"chats": n("session"), "files": len(self.files(row["id"])), "routines": n("job"), "open": len(self.space_items(row["id"]))}
 
     def space_items(self, space_id: str) -> list[dict]:
-        """Open to-dos and decisions filed under the space, by name or id."""
+        """Open to-dos and decisions in the space: tagged, filed under its name, or asked in one of its chats."""
         space = self.space(space_id)
         if not space:
             return []
         rows = self._db.execute(
-            "SELECT * FROM items WHERE kind IN ('todo', 'decision') AND status = 'open' AND space IN (?, ?)"
-            " ORDER BY created_at DESC, rowid DESC", (space["name"], space["id"])).fetchall()
+            "SELECT * FROM items WHERE kind IN ('todo', 'decision') AND status = 'open' AND (space IN (?, ?)"
+            " OR id IN (SELECT target_id FROM space_links WHERE space_id = ? AND target_type = 'item' AND state = 'on')"
+            " OR (session_id != '' AND session_id IN (SELECT target_id FROM space_links WHERE space_id = ? AND target_type = 'session' AND state = 'on')))"
+            " ORDER BY created_at DESC, rowid DESC", (space["name"], space["id"], space_id, space_id)).fetchall()
         return [_row(r) for r in rows]
 
     def create_space(self, name: str, *, icon: str = "", color: str = "", description: str = "",
-                     prompt: str = "", parent_id: Optional[str] = None, origin: str = "person") -> dict:
+                     prompt: str = "", parent_id: Optional[str] = None, origin: str = "person", kind: Optional[str] = None) -> dict:
+        """An area (the person's few big parts of life) or a topic (a client, a trip, a repo); a topic's
+        parent is its home area, a hint for grouping, not a container."""
         name = " ".join((name or "").split())
         if not name:
             raise StoreError("name is required")
+        kind = kind or ("topic" if parent_id else "area")
+        if kind not in KINDS_OF_SPACE:
+            raise StoreError("kind is area or topic")
         parent = None
         if parent_id:
             parent = self.space(parent_id)
             if not parent:
                 raise StoreError(f"no space {parent_id!r}")
-            if parent.get("parent_id"):
-                raise StoreError("sub-spaces go one level deep")
-        if self._space_named(name, parent_id):
-            raise StoreError(f"space {name!r} already exists" + (f" in {parent['name']}" if parent else ""))
-        if parent:   # a sub-space wears its parent's colour unless it's given one
+            if parent["kind"] != "area":
+                raise StoreError("a topic's home is an area")
+        if self._space_named(name, kind):
+            raise StoreError(f"space {name!r} already exists")
+        if parent:   # a topic wears its area's look unless it's given one
             color = color or parent["color"]
             icon = icon or parent["icon"]
         now = self._clock()
         with self._tx() as db:
-            base = f"{parent_id}-{_slug(name)}" if parent_id else _slug(name)
+            base = _slug(name) if kind == "area" or not db.execute("SELECT 1 FROM spaces WHERE id = ?", (_slug(name),)).fetchone() else f"{parent_id or 'topic'}-{_slug(name)}"
             space_id, n = base, 1
             while db.execute("SELECT 1 FROM spaces WHERE id = ?", (space_id,)).fetchone():
                 n += 1
                 space_id = f"{base}-{n}"
             position = db.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM spaces").fetchone()[0]
-            db.execute("INSERT INTO spaces (id, name, icon, color, description, prompt, created_at, updated_at, position, parent_id, origin)"
-                       " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO spaces (id, name, icon, color, description, prompt, created_at, updated_at, position, parent_id, origin, kind)"
+                       " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                        (space_id, name, icon or "", color or "", description or "", prompt or "", now, now, position,
-                        parent_id or None, origin if origin in ("person", "domo") else "person"))
+                        parent_id or None, origin if origin in ("person", "domo") else "person", kind))
             _touch(db, space_id, now)
         return self.space(space_id)
 
@@ -613,7 +638,7 @@ class Store:
             patch["name"] = " ".join(patch["name"].split())
             if not patch["name"]:
                 raise StoreError("name is required")
-            other = self._space_named(patch["name"], current.get("parent_id"))
+            other = self._space_named(patch["name"], current["kind"])
             if other and other["id"] != space_id:
                 raise StoreError(f"space {patch['name']!r} already exists")
         now = self._clock()
@@ -629,28 +654,60 @@ class Store:
         return self.space(space_id)
 
     def delete_space(self, space_id: str) -> None:
-        """Remove a space and its tags. Files stay, unfiled; items filed under it lose the space.
-        A sub-space's chats move up to its parent; a parent takes its sub-spaces with it."""
+        """Remove a space and its tags. Chats, files and items stay, without it; an area's topics stay too."""
         current = self.space(space_id)
         if not current:
             raise StoreError(f"no space {space_id!r}")
-        for child in self.children(space_id):
-            self.delete_space(child["id"])
         now = self._clock()
         with self._tx() as db:
-            if current.get("parent_id"):
-                db.execute("UPDATE session_spaces SET space_id = ?, updated_at = ? WHERE space_id = ?", (current["parent_id"], now, space_id))
+            db.execute("UPDATE spaces SET parent_id = NULL WHERE parent_id = ?", (space_id,))
             db.execute("DELETE FROM spaces WHERE id = ?", (space_id,))
-            db.execute("DELETE FROM session_spaces WHERE space_id = ?", (space_id,))
-            db.execute("DELETE FROM job_spaces WHERE space_id = ?", (space_id,))
+            db.execute("DELETE FROM space_links WHERE space_id = ?", (space_id,))
             db.execute("UPDATE files SET space_id = NULL WHERE space_id = ?", (space_id,))
             _refile(db, current["name"], "", now)
             _refile(db, space_id, "", now)
             _touch(db, space_id, now)
 
-    def _space_named(self, name: str, parent_id: Optional[str] = None) -> Optional[dict]:
-        row = self._db.execute("SELECT * FROM spaces WHERE lower(name) = lower(?) AND COALESCE(parent_id, '') = ?",
-                               (name, parent_id or "")).fetchone()
+    def merge_spaces(self, source: str, into: str) -> dict:
+        """Two names for one thing (Lissabon, Lisbon): everything tagged with one moves to the other, and
+        the old name is kept as an alias so it's recognised next time."""
+        a, b = self.space(source), self.space(into)
+        if not a or not b or source == into:
+            raise StoreError("merge two different spaces")
+        now = self._clock()
+        aliases = sorted({*self.aliases(into), a["name"], *self.aliases(source)} - {b["name"]})
+        with self._tx() as db:
+            for r in db.execute("SELECT * FROM space_links WHERE space_id = ?", (source,)).fetchall():
+                db.execute("INSERT INTO space_links (space_id, target_type, target_id, by, confidence, reason, state, at) VALUES (?,?,?,?,?,?,?,?)"
+                           " ON CONFLICT(space_id, target_type, target_id) DO NOTHING",
+                           (into, r["target_type"], r["target_id"], r["by"], r["confidence"], r["reason"], r["state"], r["at"]))
+            db.execute("UPDATE spaces SET aliases = ?, updated_at = ?, quiet = 0 WHERE id = ?", (json.dumps(aliases), now, into))
+            db.execute("UPDATE files SET space_id = ? WHERE space_id = ?", (into, source))
+            db.execute("DELETE FROM space_links WHERE space_id = ?", (source,))
+            db.execute("DELETE FROM spaces WHERE id = ?", (source,))
+            _refile(db, a["name"], b["name"], now)
+            _touch(db, into, now)
+            _touch(db, source, now)
+        return self.space(into)
+
+    def set_space_meta(self, space_id: str, *, parent_id: Optional[str] = ..., quiet: Optional[bool] = None) -> None:
+        """What the stitcher keeps up to date: a topic's home area, and whether it has gone quiet."""
+        sets, args = [], []
+        if parent_id is not ...:
+            sets.append("parent_id = ?"); args.append(parent_id)
+        if quiet is not None:
+            sets.append("quiet = ?"); args.append(1 if quiet else 0)
+        if sets:
+            with self._tx() as db:
+                db.execute(f"UPDATE spaces SET {', '.join(sets)} WHERE id = ?", (*args, space_id))
+
+    def aliases(self, space_id: str) -> list[str]:
+        row = self._db.execute("SELECT aliases FROM spaces WHERE id = ?", (space_id,)).fetchone()
+        return json.loads(row[0] or "[]") if row else []
+
+    def _space_named(self, name: str, kind: Optional[str] = None) -> Optional[dict]:
+        row = self._db.execute("SELECT * FROM spaces WHERE lower(name) = lower(?)" + (" AND kind = ?" if kind else ""),
+                               (name, kind) if kind else (name,)).fetchone()
         return _space(row) if row else None
 
     def spaces_changed_since(self, seq: int) -> list[str]:
@@ -658,31 +715,90 @@ class Store:
                                 " ORDER BY item_id", (seq,)).fetchall()
         return [r[0].removeprefix("space:") for r in rows]
 
-    # ---- what belongs to a space -------------------------------------------------------------
+    # ---- tags: what belongs to which spaces ------------------------------------------------
+
+    def tag(self, target: str, target_id: str, space_id: str, *, by: str = "person", confidence: Optional[float] = None, reason: str = "") -> bool:
+        """Put a chat (file, routine, item) in a space. Domo never puts back a tag the person took off,
+        and never overwrites one the person put on."""
+        if target not in TARGETS:
+            raise StoreError(f"target is one of {', '.join(TARGETS)}")
+        if not self.space(space_id):
+            raise StoreError(f"no space {space_id!r}")
+        row = self._db.execute("SELECT * FROM space_links WHERE space_id = ? AND target_type = ? AND target_id = ?", (space_id, target, target_id)).fetchone()
+        if by == "domo" and row and (row["state"] == "off" or row["by"] == "person"):
+            return row["state"] == "on"
+        now = self._clock()
+        with self._tx() as db:
+            db.execute("INSERT INTO space_links (space_id, target_type, target_id, by, confidence, reason, state, at) VALUES (?,?,?,?,?,?, 'on', ?)"
+                       " ON CONFLICT(space_id, target_type, target_id) DO UPDATE SET by=excluded.by, confidence=excluded.confidence,"
+                       " reason=excluded.reason, state='on', at=excluded.at", (space_id, target, target_id, by, confidence, reason[:200], now))
+            db.execute("UPDATE spaces SET quiet = 0 WHERE id = ?", (space_id,))
+            _touch(db, space_id, now)
+        return True
+
+    def untag(self, target: str, target_id: str, space_id: str, *, by: str = "person") -> None:
+        """Take a tag off. The person's removal is remembered, so Domo doesn't put it back."""
+        now = self._clock()
+        with self._tx() as db:
+            if by == "person":
+                db.execute("INSERT INTO space_links (space_id, target_type, target_id, by, state, at) VALUES (?,?,?, 'person', 'off', ?)"
+                           " ON CONFLICT(space_id, target_type, target_id) DO UPDATE SET by='person', state='off', confidence=NULL, at=excluded.at",
+                           (space_id, target, target_id, now))
+            else:
+                db.execute("DELETE FROM space_links WHERE space_id = ? AND target_type = ? AND target_id = ? AND by = 'domo'", (space_id, target, target_id))
+            _touch(db, space_id, now)
+
+    def tags(self, target: str, target_id: str, *, include_off: bool = False) -> list[dict]:
+        """A thing's spaces, its area first, then topics, surest first."""
+        rows = self._db.execute(
+            "SELECT l.*, s.kind, s.name FROM space_links l JOIN spaces s ON s.id = l.space_id WHERE l.target_type = ? AND l.target_id = ?"
+            + ("" if include_off else " AND l.state = 'on'") + " ORDER BY s.kind = 'topic', COALESCE(l.confidence, 1) DESC", (target, target_id)).fetchall()
+        return [dict(r) for r in rows]
+
+    def tag_map(self, target: str) -> dict[str, list[dict]]:
+        """Every tagged thing of one kind: id → its tags (area first)."""
+        out: dict[str, list[dict]] = {}
+        for r in self._db.execute(
+                "SELECT l.space_id, l.target_id, l.by, l.confidence, l.reason, s.kind FROM space_links l JOIN spaces s ON s.id = l.space_id"
+                " WHERE l.target_type = ? AND l.state = 'on' ORDER BY s.kind = 'topic', COALESCE(l.confidence, 1) DESC", (target,)):
+            out.setdefault(r["target_id"], []).append({"space_id": r["space_id"], "by": r["by"], "confidence": r["confidence"], "reason": r["reason"], "kind": r["kind"]})
+        return out
+
+    def tagged(self, space_id: str, target: str) -> list[str]:
+        return [r[0] for r in self._db.execute("SELECT target_id FROM space_links WHERE space_id = ? AND target_type = ? AND state = 'on' ORDER BY at DESC", (space_id, target))]
+
+    def related(self, space_id: str, limit: int = 6) -> list[dict]:
+        """The spaces this one's chats are also in, most shared first."""
+        rows = self._db.execute(
+            "SELECT b.space_id, COUNT(*) AS n FROM space_links a JOIN space_links b ON a.target_type = b.target_type AND a.target_id = b.target_id"
+            " WHERE a.space_id = ? AND b.space_id != ? AND a.state = 'on' AND b.state = 'on' GROUP BY b.space_id ORDER BY n DESC LIMIT ?",
+            (space_id, space_id, limit)).fetchall()
+        return [{**self.space(r[0]), "shared": r[1]} for r in rows if self.space(r[0])]
+
+    # the single-space view the rest of the app grew up with: a chat's area (or its first tag)
 
     def tag_session(self, session_id: str, space_id: Optional[str], *, by: str = "person",
                     confidence: Optional[float] = None, reason: str = "") -> Optional[str]:
-        """File a chat under a space (None unfiles it). Domo files only what the person hasn't: their
-        filing, or their unfiling, stands."""
-        old = self.session_space(session_id)
-        if by == "domo" and old and old["filed_by"] == "person":
-            return old["space_id"] or None
-        now = self._clock()
-        with self._tx() as db:
-            if not space_id and by == "person" and old:
-                # unfiled by hand: remembered as the person's choice, so Domo leaves it unfiled
-                db.execute("UPDATE session_spaces SET space_id = '', filed_by = 'person', confidence = NULL, reason = '',"
-                           " updated_at = ? WHERE session_id = ?", (now, session_id))
-            elif not space_id:
-                db.execute("DELETE FROM session_spaces WHERE session_id = ?", (session_id,))
-            else:
-                db.execute("INSERT INTO session_spaces (session_id, space_id, updated_at, filed_by, confidence, reason) VALUES (?,?,?,?,?,?)"
-                           " ON CONFLICT(session_id) DO UPDATE SET space_id=excluded.space_id, updated_at=excluded.updated_at,"
-                           " filed_by=excluded.filed_by, confidence=excluded.confidence, reason=excluded.reason",
-                           (session_id, space_id, now, by, confidence, reason[:200]))
-            for touched in {old and old["space_id"], space_id} - {None, ""}:
-                _touch(db, touched, now)
-        return space_id or None
+        """Move a chat to a space: an area replaces its area, a topic is added (with its home area when
+        the chat has none). None, by the person, takes every tag off and keeps them off."""
+        current = self.tags("session", session_id)
+        if not space_id:
+            for t in current:
+                self.untag("session", session_id, t["space_id"], by=by)
+            return None
+        target = self.space(space_id)
+        if not target:
+            raise StoreError(f"no space {space_id!r}")
+        if target["kind"] == "area":
+            for t in current:
+                if t["kind"] == "area" and t["space_id"] != space_id:
+                    self.untag("session", session_id, t["space_id"], by=by)
+            self.tag("session", session_id, space_id, by=by, confidence=confidence, reason=reason)
+        else:
+            self.tag("session", session_id, space_id, by=by, confidence=confidence, reason=reason)
+            if target.get("parent_id") and not any(t["kind"] == "area" for t in current):
+                self.tag("session", session_id, target["parent_id"], by=by, confidence=confidence, reason=reason)
+        return (self.session_space(session_id) or {}).get("space_id")
 
     def filing_attempted(self, session_id: str, revision: int) -> None:
         with self._tx() as db:
@@ -692,12 +808,18 @@ class Store:
         return {r[0]: r[1] for r in self._db.execute("SELECT session_id, revision FROM filing_attempts")}
 
     def filings(self) -> dict[str, dict]:
-        """Every chat's filing: space, who, how sure, why (an empty space: unfiled by the person)."""
-        return {r["session_id"]: dict(r) for r in self._db.execute("SELECT * FROM session_spaces")}
+        """Every chat with a tag on or off: its main space, who put it there, how sure, why."""
+        out = {}
+        for sid in {r[0] for r in self._db.execute("SELECT DISTINCT target_id FROM space_links WHERE target_type = 'session'")}:
+            out[sid] = self.session_space(sid) or {"session_id": sid, "space_id": "", "filed_by": "person", "confidence": None, "reason": ""}
+        return out
 
     def session_space(self, session_id: str) -> Optional[dict]:
-        row = self._db.execute("SELECT * FROM session_spaces WHERE session_id = ?", (session_id,)).fetchone()
-        return dict(row) if row else None
+        t = self.tags("session", session_id)
+        if not t:
+            return None
+        main = t[0]
+        return {"session_id": session_id, "space_id": main["space_id"], "filed_by": main["by"], "confidence": main["confidence"], "reason": main["reason"]}
 
     # ---- feedback on suggestions -----------------------------------------------------------
 
@@ -734,22 +856,19 @@ class Store:
         return [r[0] for r in self._db.execute("SELECT session_id FROM archived_sessions ORDER BY archived_at DESC")]
 
     def session_tags(self) -> dict[str, str]:
-        return {r[0]: r[1] for r in self._db.execute("SELECT session_id, space_id FROM session_spaces WHERE space_id != ''")}
+        """chat → its main space (area first): the single-space view."""
+        return {sid: t[0]["space_id"] for sid, t in self.tag_map("session").items()}
 
     def tag_job(self, job_id: str, space_id: Optional[str]) -> Optional[str]:
-        old = self.job_tags().get(job_id)
-        with self._tx() as db:
-            if space_id:
-                db.execute("INSERT INTO job_spaces (job_id, space_id) VALUES (?, ?)"
-                           " ON CONFLICT(job_id) DO UPDATE SET space_id=excluded.space_id", (job_id, space_id))
-            else:
-                db.execute("DELETE FROM job_spaces WHERE job_id = ?", (job_id,))
-            for touched in {old, space_id} - {None, ""}:
-                _touch(db, touched, self._clock())
+        for t in self.tags("job", job_id):
+            if space_id is None or (self.space(space_id) or {}).get("kind") == t["kind"]:
+                self.untag("job", job_id, t["space_id"])
+        if space_id:
+            self.tag("job", job_id, space_id)
         return space_id or None
 
     def job_tags(self) -> dict[str, str]:
-        return {r[0]: r[1] for r in self._db.execute("SELECT job_id, space_id FROM job_spaces")}
+        return {jid: t[0]["space_id"] for jid, t in self.tag_map("job").items()}
 
     def add_file(self, path: str, name: str, mime: str, size: int, *, space_id: Optional[str] = None,
                  session_id: Optional[str] = None) -> dict:
@@ -772,11 +891,34 @@ class Store:
                        " WHERE path = ?", (session_id or None, space_id or None, path))
 
     def files(self, space_id: Optional[str] = None, limit: int = 200) -> list[dict]:
+        """Uploads, newest first; for a space, those filed in it, tagged with it, or sent in its chats."""
         sql, args = "SELECT * FROM files", []
         if space_id:
-            sql += " WHERE space_id = ?"; args.append(space_id)
+            sql += (" WHERE space_id = ? OR path IN (SELECT target_id FROM space_links WHERE space_id = ? AND target_type = 'file' AND state = 'on')"
+                    " OR session_id IN (SELECT target_id FROM space_links WHERE space_id = ? AND target_type = 'session' AND state = 'on')")
+            args += [space_id, space_id, space_id]
         sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"; args.append(max(1, min(limit, 500)))
         return [dict(r) for r in self._db.execute(sql, args).fetchall()]
+
+    def _migrate_to_tags(self) -> None:
+        """Once: spaces with a parent become topics, and every filing becomes a tag (a topic's chats in
+        its area too). The old tables stay, unread, as they were."""
+        if self._db.execute("SELECT 1 FROM space_links LIMIT 1").fetchone() or self._db.execute("SELECT value FROM meta WHERE key = 'tags_migrated'").fetchone():
+            return
+        now = self._clock()
+        with self._tx() as db:
+            db.execute("UPDATE spaces SET kind = 'topic' WHERE parent_id IS NOT NULL")
+            parents = {r[0]: r[1] for r in db.execute("SELECT id, parent_id FROM spaces")}
+            for r in db.execute("SELECT * FROM session_spaces WHERE space_id != ''").fetchall():
+                for sid in (r["space_id"], parents.get(r["space_id"])):
+                    if sid and sid in parents:
+                        db.execute("INSERT OR IGNORE INTO space_links (space_id, target_type, target_id, by, confidence, reason, state, at)"
+                                   " VALUES (?, 'session', ?, ?, ?, ?, 'on', ?)", (sid, r["session_id"], r["filed_by"], r["confidence"], r["reason"], r["updated_at"]))
+            for r in db.execute("SELECT * FROM job_spaces").fetchall():
+                if r["space_id"] in parents:
+                    db.execute("INSERT OR IGNORE INTO space_links (space_id, target_type, target_id, by, state, at) VALUES (?, 'job', ?, 'person', 'on', ?)",
+                               (r["space_id"], r["job_id"], now))
+            db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('tags_migrated', '1')")
 
     # ---- summary -----------------------------------------------------------------------------
 

@@ -1,17 +1,18 @@
-"""Filing: every chat in its place without being asked (Work › Baltazar, Coding › Domo, Personal › Resor).
+"""Tagging: every chat in its places without being asked. One area (Work, Coding, Personal, Lykke) and up
+to three topics (Baltazar, Domo, Thailand), reusing what exists and making a topic only when the chat
+keeps naming it.
 
-The person just starts chatting. After a chat's first turn, and again in the "Domo filing" routine for
-anything left over, Domo asks Jev (TypeSafe's decision model: typed answers with calibrated confidence,
-in a few hundred milliseconds, for a fraction of a cent) two questions about it:
+The person just starts chatting. After a chat's first turns, and again from the stitcher for anything
+new, Domo asks Jev (TypeSafe's decision model: typed answers with calibrated confidence, in a few
+hundred milliseconds, for a fraction of a cent) in one request:
 
-- which space is this about (one of the person's top-level spaces, or none)?
-- what, inside it, is it about: one of the existing sub-spaces, a named thing the chat keeps coming
-  back to (a client, a repo, a trip), or nothing specific?
+- which area is this about (a choice among the person's areas, or none)?
+- for each topic it might be about (the ones it names, then the most recent): is it? (a yes/no each)
+- for each name the chat keeps coming back to that isn't a topic yet: is it mainly about that?
 
-Jev chooses; it doesn't write. So the names a new sub-space can take come from the chat itself
-(``candidates``: proper nouns, quoted names, repo names), and Jev picks among them. Code, not the model,
-owns the thresholds: below them a chat is filed one level up, or left unfiled. Anything the person filed,
-moved or unfiled by hand is never touched (store.tag_session).
+Jev chooses; it doesn't write. So a new topic's name comes from the chat itself (``candidates``: proper
+nouns, quoted names, repo names). Code, not the model, owns the thresholds. A tag the person put on or
+took off is never touched (store.tag).
 """
 
 from __future__ import annotations
@@ -31,10 +32,8 @@ from . import search
 
 log = logging.getLogger("domo.filing")
 
-SPACE_MIN = 0.6        # sure enough of the space to file it there
-SUB_MIN = 0.6          # sure enough of an existing sub-space
-NEW_MIN = 0.75         # sure enough of a new one to make it
-SPECIFIC_MIN = 0.7     # sure the chat is about one named thing at all
+SPACE_MIN = 0.6        # sure enough of the area to tag it
+NEW_MIN = 0.85         # sure enough of a new topic to make it
 MAX_TEXT = 4000
 SKIP_TITLES = {"domo inbox"}
 
@@ -134,7 +133,7 @@ def chat_text(home: Path, session_id: str) -> Optional[dict]:
             return None
         rows = db.execute("SELECT role, content FROM messages WHERE session_id = ? AND role IN ('user','assistant') AND active = 1"
                           " AND COALESCE(content, '') != '' ORDER BY id LIMIT 8", (session_id,)).fetchall()
-        lines = [f"{'Person' if r['role'] == 'user' else 'Domo'}: {search.clean(r['content'])[:1200]}" for r in rows]
+        lines = [f"{'Person' if r['role'] == 'user' else 'Assistant'}: {search.clean(r['content'])[:1200]}" for r in rows]
         users = sum(1 for r in rows if r["role"] == "user")
         return {"title": s["title"] or "", "source": s["source"] or "", "revision": int(s["rev"] or 0),
                 "text": "\n".join(lines)[:MAX_TEXT], "turns": users}
@@ -142,84 +141,108 @@ def chat_text(home: Path, session_id: str) -> Optional[dict]:
         db.close()
 
 
+TOPIC_MIN = 0.75       # sure it's about an existing topic
+MAX_TOPICS = 3
+ASK_TOPICS = 12        # existing topics asked about per chat: the ones it names, then the most recent
+
+
 def classify(store, title: str, text: str) -> Optional[dict]:
-    """Where a chat goes: {space_id, new_sub (a name to create under it) or None, confidence, reason}, or None."""
-    tops = [s for s in store.spaces() if not s.get("parent_id")]
-    if not tops:
+    """A chat's area and topics: {area, area_conf, topics: [{id|None, name, p}], reason}, or None."""
+    spaces = store.spaces(include_quiet=True)
+    areas = [s for s in spaces if s["kind"] == "area"]
+    topics = [s for s in spaces if s["kind"] == "topic"]
+    if not areas and not topics:
         return None
-    kids = [s for s in store.spaces() if s.get("parent_id")]
-    names = {s["id"]: s["name"] for s in tops}
-    fresh = [c for c in candidates(f"{title}\n{text}", [k["name"] for k in kids])
-             if not any(c.lower() == k["name"].lower() for k in kids) and c.lower() not in {n.lower() for n in names.values()}][:8]
-    space_q = {s["id"]: (f"{s['name']}: {s['description']}" if s["description"] else s["name"])[:300] for s in tops}
-    space_q["none"] = "None of these, or it isn't clear from the chat"
-    sub_q = {f"s{i}": f"{names.get(k['parent_id'], '')} › {k['name']}" + (f": {k['description']}" if k["description"] else "")
-             for i, k in enumerate(kids)}
-    sub_q.update({f"n{i}": c for i, c in enumerate(fresh)})
-    sub_q["none"] = "No one specific project, client, person, place, trip or repo"
-    state = f"Chat title: {title or '(untitled)'}\n\n{text}"
-    answers = ask(state, {
-        "space": {"type": "choice", "instructions": "Which part of the person's life is this chat about?", "criteria": space_q},
-        "subject": {"type": "choice", "instructions": "Which project, client, person, place, trip or repo is the chat mainly about?", "criteria": sub_q},
-        "specific": {"type": "noul", "instructions": "Is the chat mainly about one specific, named project, client, person, place, trip or repo?"},
-    })
-    space = answers.get("space", {})
-    space_id, sure = space.get("choice"), float(space.get("confidence") or 0)
-    if space_id not in names or sure < SPACE_MIN:
+    body = f"{title}\n{text}"
+    low = body.lower()
+    names = {t["id"]: [t["name"], *store.aliases(t["id"])] for t in topics}
+    said = lambda n: re.search(rf"(?<![\w]){re.escape(n.lower())}(?![\w])", low) is not None  # noqa: E731
+    mentioned = [t for t in topics if any(said(n) for n in names[t["id"]])]
+    asking = (mentioned + [t for t in topics if t not in mentioned])[:ASK_TOPICS]
+    taken = {n.lower() for ns in names.values() for n in ns} | {a["name"].lower() for a in areas}
+    fresh = [c for c in candidates(body, [n for ns in names.values() for n in ns]) if c.lower() not in taken][:5]
+    questions: dict = {}
+    if areas:
+        crit = {a["id"]: (f"{a['name']}: {a['description']}" if a["description"] else a["name"])[:300] for a in areas}
+        crit["none"] = "None of these, or it isn't clear from the chat"
+        questions["area"] = {"type": "choice", "instructions": "Which part of the person's life is this chat about?", "criteria": crit}
+    for i, t in enumerate(asking):
+        about = f"{t['name']}" + (f" ({t['description']})" if t["description"] else "")
+        questions[f"t{i}"] = {"type": "noul", "instructions": f"Is this chat about {about}?"}
+    for i, c in enumerate(fresh):
+        questions[f"n{i}"] = {"type": "noul", "instructions": f"Is this chat mainly about {c}, a specific project, client, person, place, trip or repo?"}
+    answers = ask(f"Chat title: {title or '(untitled)'}\n\n{text}", questions)
+    area, area_conf = None, 0.0
+    a = answers.get("area") or {}
+    if a.get("choice") in {x["id"] for x in areas} and float(a.get("confidence") or 0) >= SPACE_MIN:
+        area, area_conf = a["choice"], float(a["confidence"])
+    picked = []
+    for i, t in enumerate(asking):
+        p = float((answers.get(f"t{i}") or {}).get("noul") or 0)
+        if p >= TOPIC_MIN:
+            picked.append({"id": t["id"], "name": t["name"], "p": p})
+    for i, c in enumerate(fresh):
+        p = float((answers.get(f"n{i}") or {}).get("noul") or 0)
+        times = len(re.findall(rf"(?<![\w]){re.escape(c)}(?![\w])", body))   # as a name: "Plan" ≠ "a plan"
+        # a new topic only when no existing one fits, and for what the chat is plainly about: in its title,
+        # or named more than once. Reuse first keeps the topics few as the chats pile up.
+        if p >= NEW_MIN and not any(x["id"] for x in picked) and (times >= 2 or c.lower() in title.lower()):
+            picked.append({"id": None, "name": c, "p": p})
+    picked.sort(key=lambda x: (x["id"] is None, -x["p"]))   # what exists first, then the surest
+    picked = picked[:MAX_TOPICS]
+    if not area and not picked:
         return None
-    subject = answers.get("subject", {})
-    pick, sub_sure = subject.get("choice") or "none", float(subject.get("confidence") or 0)
-    specific = float((answers.get("specific") or {}).get("noul") or 0)
-    if pick.startswith("s") and pick[1:].isdigit():
-        kid = kids[int(pick[1:])]
-        if kid["parent_id"] == space_id and sub_sure >= SUB_MIN:
-            return {"space_id": kid["id"], "new_sub": None, "confidence": round(min(sure, sub_sure), 2),
-                    "reason": f"about {kid['name']} ({round(sub_sure * 100)}% sure)"}
-    if pick.startswith("n") and pick[1:].isdigit():
-        name = fresh[int(pick[1:])]
-        mentioned = len(re.findall(re.escape(name.lower()), f"{title}\n{text}".lower()))
-        # a new sub-space only for something the chat is plainly about: named in its title, or more than once
-        if sub_sure >= NEW_MIN and specific >= SPECIFIC_MIN and (mentioned >= 2 or name.lower() in title.lower()):
-            return {"space_id": space_id, "new_sub": name, "confidence": round(min(sure, sub_sure, specific), 2),
-                    "reason": f"about {name}, new ({round(sub_sure * 100)}% sure)"}
-    return {"space_id": space_id, "new_sub": None, "confidence": round(sure, 2), "reason": f"{names[space_id]} ({round(sure * 100)}% sure)"}
+    named = [next(x["name"] for x in areas if x["id"] == area)] if area else []
+    reason = " · ".join(named + [f"{x['name']}{' (new)' if x['id'] is None else ''}" for x in picked])
+    return {"area": area, "area_conf": round(area_conf, 2), "topics": picked, "reason": reason}
 
 
-# ---- filing ------------------------------------------------------------------------------------
+# ---- tagging -----------------------------------------------------------------------------------
 
 def file_session(home: Path, store, session_id: str) -> Optional[dict]:
-    """File one chat if no one has: returns what was done, or None when it stays where it is."""
-    current = store.filings().get(session_id)
-    if current and (current["filed_by"] == "person" or current["space_id"]):
-        return None
+    """Tag one chat with its area and topics; adds to what's there, never moves what the person set."""
     chat = chat_text(home, session_id)
     if not chat or chat["source"] in (*search.HIDDEN_SOURCES, "cron") or chat["title"].lower() in SKIP_TITLES or len(chat["text"]) < 12:
         return None
     if store.filing_attempts().get(session_id) == chat["revision"]:
         return None   # nothing new said since it was last looked at
+    current = store.tags("session", session_id, include_off=True)
+    if current and all(t["state"] == "off" for t in current):
+        store.filing_attempted(session_id, chat["revision"])
+        return None   # the person took its tags off: it stays as they left it
     try:
         d = classify(store, chat["title"], chat["text"])
     except FilingError as exc:
-        log.info("filing %s skipped: %s", session_id, exc)
+        log.info("tagging %s skipped: %s", session_id, exc)
         return None
     store.filing_attempted(session_id, chat["revision"])
     if not d:
         return None
-    space_id = d["space_id"]
-    if d["new_sub"]:
-        existing = next((s for s in store.children(space_id) if s["name"].lower() == d["new_sub"].lower()), None)
-        space_id = (existing or store.create_space(d["new_sub"], parent_id=space_id, origin="domo"))["id"]
-    filed = store.tag_session(session_id, space_id, by="domo", confidence=d["confidence"], reason=d["reason"])
-    if filed != space_id:
+    on = {t["space_id"] for t in current if t["state"] == "on"}
+    has_area = any(t["kind"] == "area" and t["state"] == "on" for t in current)
+    added, created = [], []
+    if d["area"] and not has_area and store.tag("session", session_id, d["area"], by="domo", confidence=d["area_conf"], reason=d["reason"]):
+        added.append(d["area"])
+    home_area = d["area"] or next((t["space_id"] for t in current if t["kind"] == "area" and t["state"] == "on"), None)
+    for t in d["topics"]:
+        tid = t["id"]
+        if tid is None:
+            existing = store._space_named(t["name"], "topic")
+            tid = existing["id"] if existing else store.create_space(t["name"], kind="topic", parent_id=home_area, origin="domo")["id"]
+            if not existing:
+                created.append(t["name"])
+        if tid not in on and store.tag("session", session_id, tid, by="domo", confidence=round(t["p"], 2), reason=d["reason"]):
+            added.append(tid)
+    if not added:
         return None
-    where = " › ".join(s["name"] for s in store.lineage(space_id))
-    store.note("filed", f"filed “{chat['title'] or 'a chat'}” under {where}", ref=session_id, space=where)
-    return {"session_id": session_id, "title": chat["title"], "space_id": space_id, "where": where,
-            "created": bool(d["new_sub"]), **{k: d[k] for k in ("confidence", "reason")}}
+    names = [store.space(x)["name"] for x in added if store.space(x)]
+    store.note("filed", f"tagged “{chat['title'] or 'a chat'}” {', '.join(names)}", ref=session_id, space=names[0] if names else "")
+    return {"session_id": session_id, "title": chat["title"], "tags": added, "where": " · ".join(names),
+            "created": bool(created), "new_topics": created, "reason": d["reason"]}
 
 
 def after_turn(home: Path, store, session_id: str) -> Optional[dict]:
-    """Right after a chat's first turns: file it while it's fresh. Later turns wait for the routine."""
+    """Right after a chat's first turns: tag it while it's fresh. Later turns wait for the stitcher."""
     chat = chat_text(home, session_id)
     if not chat or chat["turns"] > 3:
         return None
@@ -227,22 +250,22 @@ def after_turn(home: Path, store, session_id: str) -> Optional[dict]:
 
 
 def sweep(home: Path, store, *, limit: int = 40, days: int = 30) -> list[dict]:
-    """The routine's pass: chats from the last month no one has filed and that have something new."""
+    """The stitcher's pass: chats from the last month with something new said since they were last looked at."""
     db = search._hermes(home)
     if db is None:
         return []
     try:
         hidden = ",".join("?" * len(search.HIDDEN_SOURCES))
-        ids = [r[0] for r in db.execute(
-            f"SELECT id FROM sessions WHERE source NOT IN ({hidden}, 'cron') AND hidden = 0 AND COALESCE(archived, 0) = 0"
+        rows = db.execute(
+            f"SELECT id, COALESCE(transcript_revision, 0) FROM sessions WHERE source NOT IN ({hidden}, 'cron') AND hidden = 0 AND COALESCE(archived, 0) = 0"
             " AND COALESCE(last_activity_at, started_at) > ? ORDER BY COALESCE(last_activity_at, started_at) DESC LIMIT 400",
-            (*search.HIDDEN_SOURCES, time.time() - days * 86400))]
+            (*search.HIDDEN_SOURCES, time.time() - days * 86400)).fetchall()
     finally:
         db.close()
-    filings = store.filings()
+    seen = store.filing_attempts()
     out = []
-    for sid in [i for i in ids if i not in filings][:limit]:   # at most `limit` looks per pass
-        r = file_session(home, store, sid)   # unchanged since its last look: skipped without asking Jev
-        if r:
-            out.append(r)
+    for sid, rev in [r for r in rows if seen.get(r[0]) != r[1]][:limit]:   # at most `limit` looks per pass
+        done = file_session(home, store, sid)
+        if done:
+            out.append(done)
     return out

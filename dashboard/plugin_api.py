@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import access, bridge, filing, files as attach, memory, repos as repo_scan, rtk, search as chat_search, suggest  # noqa: E402
+from domo import access, bridge, filing, files as attach, memory, repos as repo_scan, rtk, search as chat_search, stitch, suggest  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -119,6 +119,7 @@ def profiles(request: Request):
 
 @router.get("/feed")
 def feed(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    _stitching()
     chat_search.ensure_running()
     store = _store(profile)
     return {"profile": bridge.profile_info(profile), **store.feed()}
@@ -243,7 +244,8 @@ class SpaceIn(BaseModel):
     color: str = Field("", pattern=_COLOR)
     description: str = ""
     prompt: str = ""
-    parent_id: str | None = None   # a sub-space: Work › Baltazar
+    parent_id: str | None = None   # a topic's home area
+    kind: str | None = None        # area (the person's few big parts of life) or topic
 
 
 class SpacePatch(BaseModel):
@@ -258,8 +260,14 @@ class SpaceTag(BaseModel):
     space_id: str | None = None
 
 
+def _stitching() -> None:
+    stitch.ensure_running(bridge.profile_names, _home, _store)
+
+
 @router.get("/spaces")
 def spaces(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Areas, then topics by recent activity; quiet topics come too, marked, for the app to fold away."""
+    _stitching()
     return {"spaces": _store(profile).spaces()}
 
 
@@ -289,19 +297,18 @@ async def space_detail(space_id: str, profile: str = Query(bridge.DEFAULT, alias
     from the API server; when it is down the space still shows, with tagged chats bare and no routines."""
     store = _store(profile)
     space = _space_or_404(store, space_id)
-    tags, job_tags = store.session_tags(), store.job_tags()
-    children = store.children(space_id)
-    # a space's chats include its sub-spaces' chats, each saying where it's filed
-    inside = {space_id, *(c["id"] for c in children)}
+    in_space = set(store.tagged(space_id, "session"))
+    jobs_in = set(store.tagged(space_id, "job"))
+    chat_tags = store.tag_map("session")
     try:
         sessions = _rows(await _passthrough(profile, "GET", "/api/sessions", params={"limit": 200}), "data", "sessions")
     except HTTPException:
-        sessions = [{"id": sid} for sid, tagged in tags.items() if tagged in inside]
+        sessions = [{"id": sid} for sid in in_space]
     try:
-        jobs = _rows(await _passthrough(profile, "GET", "/api/jobs"), "jobs")
+        jobs = _rows(await _passthrough(profile, "GET", "/api/jobs", params={"include_disabled": "true"}), "jobs")
     except HTTPException:
         jobs = []
-    routines = [{**j, "space_id": space_id} for j in jobs if job_tags.get(str(j.get("id"))) == space_id]
+    routines = [{**j, "space_id": space_id} for j in jobs if str(j.get("id")) in jobs_in]
     job_ids = {j["name"]: j.get("id") for j in routines if j.get("name")}
     runs = []
     for s in sessions:
@@ -309,11 +316,22 @@ async def space_detail(space_id: str, profile: str = Query(bridge.DEFAULT, alias
         if match and match["job"] in job_ids:
             runs.append({**_chat(s), "job_id": job_ids[match["job"]]})
     run_ids = {r["id"] for r in runs}
-    filings = store.filings()
-    chats = [{**_chat(s), "space_id": tags.get(s.get("id")), **_filed(filings.get(s.get("id")))} for s in sessions
-             if tags.get(s.get("id")) in inside or (s.get("id") in run_ids and not tags.get(s.get("id")))]
-    return {"space": space, "lineage": store.lineage(space_id), "children": children, "chats": _newest(chats),
-            "files": store.files(space_id), "routines": routines, "runs": _newest(runs)[:10], "items": store.space_items(space_id)}
+    chats = [{**_chat(s), **_tagged(chat_tags.get(s.get("id"), []))} for s in sessions
+             if s.get("id") in in_space or (s.get("id") in run_ids and s.get("id") not in chat_tags)]
+    # everything about it in one place: its chats, files, routines and their runs, open items, and
+    # for an area its topics; for any space, the spaces it's most often with
+    return {"space": space, "lineage": store.lineage(space_id), "children": store.children(space_id) if space["kind"] == "area" else [],
+            "related": store.related(space_id), "chats": _newest(chats), "files": store.files(space_id), "routines": routines,
+            "runs": _newest(runs)[:10], "items": store.space_items(space_id)}
+
+
+def _tagged(tags: list[dict]) -> dict:
+    """A chat's tags for the app: its main space (area first) and every tag, who put it there and how sure."""
+    if not tags:
+        return {"space_id": None, "tags": []}
+    main = tags[0]
+    return {"space_id": main["space_id"], "tags": [{"space_id": t["space_id"], "by": t["by"], "confidence": t["confidence"]} for t in tags],
+            "filed_by": main["by"], "filing_confidence": main["confidence"], "filing_reason": main["reason"]}
 
 
 def _filed(f: Optional[dict]) -> dict:
@@ -356,16 +374,23 @@ PLAN_MODE = ("[Plan mode] Investigate and propose; change nothing. Read files, s
              " worked. Don't edit files, run anything that writes, commit, push or message anyone until they say go.")
 
 
-def _space_instructions(space: dict, parent: Optional[dict] = None) -> str:
-    """A chat in a space works the space's way: its name and prompt go to Hermes as this turn's extra
-    system prompt (the API's ``instructions``), so they never become part of the message, its history or
-    the chat's title, and an edited prompt applies from the next turn. A sub-space adds its own to its
-    parent's: Work's way of working, then what's particular to Baltazar."""
-    if parent:
-        head = f"[Domo space: {parent['name']} › {space['name']}]"
-        parts = [parent["prompt"], space["description"] and f"This chat is about {space['name']}: {space['description']}", space["prompt"]]
-        return head + "".join(f"\n{p}" for p in parts if p)
-    return f"[Domo space: {space['name']}]" + (f"\n{space['prompt']}" if space["prompt"] else "")
+CONTEXT_LIMIT = 1600
+
+
+def _tag_context(store, session_id: str) -> str:
+    """What the chat's spaces tell Domo: context only, never orders. Each space's description and notes, area
+    first, the surest topics after, kept short so it costs little on every turn."""
+    lines = []
+    for t in store.tags("session", session_id)[:4]:
+        s = store.space(t["space_id"])
+        if not s:
+            continue
+        bits = [b for b in (s["description"], s["prompt"] and f"Notes: {s['prompt']}") if b]
+        lines.append(f"- {s['name']} ({s['kind']}){': ' + ' '.join(bits) if bits else ''}")
+    if not lines:
+        return ""
+    text = "[Domo context] This chat is about:\n" + "\n".join(lines)
+    return text if len(text) <= CONTEXT_LIMIT else text[: CONTEXT_LIMIT - 1].rsplit(" ", 1)[0] + "…"
 
 
 # ---- repos ------------------------------------------------------------------------------------
@@ -432,11 +457,11 @@ async def search(q: str = "", profile: str = Query(bridge.DEFAULT, alias="agent"
     chat_search.ensure_running()
     _home(profile)
     store = _store(profile)
-    tags = store.session_tags()
-    only = {sid for sid, sp in tags.items() if sp == space_id} if space_id else None
+    only = set(store.tagged(space_id, "session")) if space_id else None
     found = await asyncio.to_thread(chat_search.search, profile, q, limit=limit, sessions=only)
+    chat_tags = store.tag_map("session")
     for row in found["results"]:
-        row["space_id"] = tags.get(row["session_id"])
+        row.update({k: v for k, v in _tagged(chat_tags.get(row["session_id"], [])).items() if k in ("space_id", "tags")})
     return found
 
 
@@ -533,16 +558,32 @@ def search_status(profile: str = Query(bridge.DEFAULT, alias="agent")):
 async def sessions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(30, ge=1, le=200),
                    archived: bool = False):
     store = _store(profile)
-    tags = store.session_tags()
     if archived:
         listing = {"object": "list", "data": await _archived_sessions(profile, store)}
     else:
         listing = await _passthrough(profile, "GET", "/api/sessions", params={"limit": limit})
-    filings = store.filings()
+    chat_tags = store.tag_map("session")
     for row in _rows(listing, "data", "sessions"):
-        row["space_id"] = tags.get(row.get("id"))
-        row.update(_filed(filings.get(row.get("id"))))
+        row.update(_tagged(chat_tags.get(row.get("id"), [])))
     return listing
+
+
+class TagsIn(BaseModel):
+    add: list[str] = []
+    remove: list[str] = []
+
+
+@router.put("/sessions/{session_id}/tags")
+def set_tags(session_id: str, body: TagsIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """The person adds or takes off a chat's spaces; what they take off stays off."""
+    store = _store(profile)
+    for sid in [*body.add, *body.remove]:
+        _space_or_404(store, sid)
+    for sid in body.remove:
+        store.untag("session", session_id, sid)
+    for sid in body.add:
+        store.tag("session", session_id, sid)
+    return _tagged(store.tags("session", session_id))
 
 
 class FileIn(BaseModel):
@@ -551,7 +592,7 @@ class FileIn(BaseModel):
 
 @router.post("/filing")
 async def file_now(body: FileIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
-    """Work out where chats belong now (the routine does this on its own): one, or all that are unfiled."""
+    """Tag chats now (the stitcher does this on its own every half hour): one, or all with something new."""
     home, store = _home(profile), _store(profile)
     if not filing.jev_key():
         raise HTTPException(503, "Filing needs TYPESAFE_API_KEY in the agent's environment")
@@ -669,11 +710,11 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
     content = attach.compose(body.message, found)
     tag = store.session_space(session_id)
     space = store.space(tag["space_id"]) if tag and tag["space_id"] else None
-    parent = store.space(space["parent_id"]) if space and space.get("parent_id") else None
     payload = {"message": content}
     if body.model:   # locked, so it holds: a bare model only counts on a session's first turn
         payload.update({"model": body.model, "require_model_lock": True, **({"provider": body.provider} if body.provider else {})})
-    instructions = [_space_instructions(space, parent)] if space else []
+    context = _tag_context(store, session_id)
+    instructions = [context] if context else []
     known = memory.for_prompt(store)
     if known:
         instructions.append(known)
