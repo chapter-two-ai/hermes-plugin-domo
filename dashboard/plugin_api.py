@@ -109,6 +109,29 @@ async def health(request: Request):
     return {"domo": VERSION, "profiles": profiles}
 
 
+def _git_stamp(path) -> dict:
+    """Last commit of a checkout: its date (ISO) and short hash. Empty when it isn't a git checkout."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "-C", str(path), "log", "-1", "--format=%cI|%h"], capture_output=True, text=True, timeout=3).stdout.strip()
+        date, sha = out.split("|")
+        return {"updated": date, "sha": sha}
+    except Exception:
+        return {}
+
+
+@router.get("/versions")
+def versions():
+    """The Hermes agent (its code and gateway) as installed on this Mac: version and when its code last changed."""
+    agent: dict = {}
+    try:
+        import hermes_cli
+        agent = {"version": str(getattr(hermes_cli, "__version__", "")), **_git_stamp(Path(hermes_cli.__file__).resolve().parent.parent)}
+    except Exception:
+        pass
+    return {"agent": agent}
+
+
 @router.get("/profiles")
 def profiles(request: Request):
     allowed = access.allowed_profiles(request)
